@@ -49,7 +49,9 @@ try{
       const solletCreated = !!(logs && (logs.includes('instruction: initializemint') || logs.includes('initialize mint') || logs.includes('initialize_mint') || logs.includes('createidempotent')));
       // expose sollet detection to downstream consumers and engine
       try{ ev.solletCreated = !!solletCreated; }catch(_e){}
-      // process via ledger engine (now with ev.solletCreated available)
+      // ensure slot/txBlock present on the event so the LedgerSignalEngine can use it
+      try{ if(!ev.slot) ev.slot = slot; if(!ev.txBlock) ev.txBlock = slot; }catch(_e){}
+      // process via ledger engine (now with ev.solletCreated and slot available)
       try{ eng_bridge.processEvent(ev); }catch(_e){}
       const sig = ev && (ev.signature || ev.sig || ev.transaction && ev.transaction.signatures && ev.transaction.signatures[0]) || null;
       const program = ev && ev.program || null;
@@ -76,6 +78,11 @@ const INMEM_NOTIF_MAX = Number(process.env.NOTIF_INMEM_MAX || 50);
 // optional helper: attempt to require message builder
 let _tokenUtils = null;
 try{ _tokenUtils = require('../src/utils/tokenUtils'); }catch(e){}
+
+// In-memory locks to avoid concurrent auto-exec conflicts
+const AUTO_EXEC_USER_LOCKS = new Map(); // userId -> true
+const AUTO_EXEC_TOKEN_LOCKS = new Map(); // tokenAddr -> expiryMs
+const AUTO_EXEC_TOKEN_LOCK_MS = Number(process.env.AUTO_EXEC_TOKEN_LOCK_MS) || 10000;
 
 // Programs to listen to. Can be overridden via env `KNOWN_AMM_PROGRAM_IDS` (comma-separated).
 const envPrograms = (process.env.KNOWN_AMM_PROGRAM_IDS || process.env.PROGRAMS || '').toString().split(',').map(s=>s.trim()).filter(Boolean);
@@ -115,7 +122,7 @@ const MINT_SIG_LIMIT = Number(process.env.MINT_SIG_LIMIT) || 8;
 // Proposal 1: widen default window slightly to capture marginally delayed mints
 // Increase sensible defaults so collector is less likely to reject near-edge mints
 // Proposal1: widen the age/window tolerances so marginally-delayed mints are accepted
-const MAX_MINT_AGE_SECS = Number(process.env.MAX_MINT_AGE_SECS) || 30; // seconds
+const MAX_MINT_AGE_SECS = Number(process.env.MAX_MINT_AGE_SECS) || 0; // seconds
 // Collector: allow accumulating a small number of freshly-accepted mints and
 // printing them as a single JSON array. Useful for short-lived runs/testing.
 const COLLECT_MAX = Number(process.env.COLLECT_MAX) || 3;
@@ -737,18 +744,45 @@ async function startSequentialListener(options){
                         }
                       }
                     }catch(e){}
-                    // Push into in-memory per-user queue (temporary background store)
+                    // Push into per-user queue: persist to disk only when archiving explicitly enabled
                     try{
-                      const q = global.__inMemoryNotifQueues;
-                      if(q){
-                        const key = String(uid);
-                        if(!q.has(key)) q.set(key, []);
-                        const arr = q.get(key) || [];
-                        // push standardized payload as JSON string for consumers that read the list
-                        arr.unshift(payload);
-                        // trim
-                        if(arr.length > INMEM_NOTIF_MAX) arr.length = INMEM_NOTIF_MAX;
-                        q.set(key, arr);
+                      const ENABLE_ARCHIVE = String(process.env.ENABLE_ARCHIVE || '').toLowerCase() === 'true';
+                      const usePersistent = ENABLE_ARCHIVE && ((String(process.env.LIVE_TRADES || '').toLowerCase() === 'true') || (String(process.env.NOTIF_PERSIST || '').toLowerCase() === 'true'));
+                      // By default (ENABLE_ARCHIVE not true) we avoid writing any archival files to disk.
+                      if(usePersistent){
+                        try{
+                          const notifBase = process.env.OUTPUT_DIR ? path.resolve(process.env.OUTPUT_DIR) : path.join(process.cwd(),'out','real_runs');
+                          const notifDir = path.join(notifBase, 'notifications');
+                          try{ fs.mkdirSync(notifDir, { recursive: true }); }catch(_){ }
+                          const key = String(uid);
+                          const filePath = path.join(notifDir, `${key}.json`);
+                          let arr = [];
+                          try{ const prev = fs.readFileSync(filePath, 'utf8'); arr = prev ? JSON.parse(prev) : []; }catch(_){ arr = []; }
+                          arr.unshift(payload);
+                          if(arr.length > INMEM_NOTIF_MAX) arr.length = INMEM_NOTIF_MAX;
+                          try{ fs.writeFileSync(filePath, JSON.stringify(arr, null, 2), 'utf8'); }catch(_){ }
+                          // Also persist a per-user sent_tokens file in workspace `sent_tokens/` for real-run auditing
+                          try{
+                            const sentBase = path.join(process.cwd(), 'sent_tokens');
+                            try{ fs.mkdirSync(sentBase, { recursive: true }); }catch(_){ }
+                            const sentFile = path.join(sentBase, `${key}.json`);
+                            let sentArr = [];
+                            try{ const prevs = fs.readFileSync(sentFile, 'utf8'); sentArr = prevs ? JSON.parse(prevs) : []; }catch(_){ sentArr = []; }
+                            sentArr.unshift(payload);
+                            if(sentArr.length > INMEM_NOTIF_MAX) sentArr.length = INMEM_NOTIF_MAX;
+                            try{ fs.writeFileSync(sentFile, JSON.stringify(sentArr, null, 2), 'utf8'); }catch(_){ }
+                          }catch(_){ }
+                        }catch(_){ }
+                      } else {
+                        const q = global.__inMemoryNotifQueues;
+                        if(q){
+                          const key = String(uid);
+                          if(!q.has(key)) q.set(key, []);
+                          const arr = q.get(key) || [];
+                          arr.unshift(payload);
+                          if(arr.length > INMEM_NOTIF_MAX) arr.length = INMEM_NOTIF_MAX;
+                          q.set(key, arr);
+                        }
                       }
                     }catch(e){}
                     // Emit in-process notification for same-process bots
@@ -789,9 +823,42 @@ async function startSequentialListener(options){
                                 if(typeof autoExec === 'function'){
                                   // run in background, do not block main listener loop
                                   const execTokens = Array.isArray(matched) ? matched.slice(0, Number(user.strategy && user.strategy.maxTrades ? user.strategy.maxTrades : 3) || 1) : [];
-                                  (async () => {
-                                    try{ await autoExec(user, execTokens, 'buy'); }catch(e){ try{ console.error('[listener:autoExec] error', (e && e.message) || e); }catch(_){} }
-                                  })();
+                                  // Simple in-memory locking to avoid concurrent auto-exec for the same user
+                                  try{
+                                    const uidKey = String(uid);
+                                    if(AUTO_EXEC_USER_LOCKS.has(uidKey)){
+                                      try{ console.error(`[listener:autoExec] user=${uidKey} already executing - skipping`); }catch(e){}
+                                    } else {
+                                      // cleanup expired token locks
+                                      const now = Date.now();
+                                      for(const [tk, expiry] of AUTO_EXEC_TOKEN_LOCKS.entries()){
+                                        if(!expiry || expiry <= now) AUTO_EXEC_TOKEN_LOCKS.delete(tk);
+                                      }
+                                      // filter out tokens currently in-flight
+                                      const tokensToExec = execTokens.filter(t => {
+                                        const key = (t && (t.address||t.tokenAddress||t.mint)) || String(t);
+                                        const exp = AUTO_EXEC_TOKEN_LOCKS.get(key);
+                                        return !exp || exp <= now;
+                                      });
+                                      if(tokensToExec.length === 0){
+                                        try{ console.error(`[listener:autoExec] user=${uidKey} tokens in-flight, skipping`); }catch(e){}
+                                      } else {
+                                        // reserve user lock and token locks
+                                        AUTO_EXEC_USER_LOCKS.set(uidKey, true);
+                                        const lockMs = Number(process.env.AUTO_EXEC_TOKEN_LOCK_MS) || AUTO_EXEC_TOKEN_LOCK_MS;
+                                        const expiry = Date.now() + lockMs;
+                                        for(const t of tokensToExec){
+                                          const key = (t && (t.address||t.tokenAddress||t.mint)) || String(t);
+                                          AUTO_EXEC_TOKEN_LOCKS.set(key, expiry);
+                                        }
+                                        (async () => {
+                                          try{ await autoExec(user, tokensToExec, 'buy'); }
+                                          catch(e){ try{ console.error('[listener:autoExec] error', (e && e.message) || e); }catch(_){} }
+                                          finally{ try{ AUTO_EXEC_USER_LOCKS.delete(uidKey); }catch(_){}}
+                                        })();
+                                      }
+                                    }
+                                  }catch(e){}
                                 }
                               }catch(e){ /* ignore auto-exec errors */ }
                             } else if(shouldAuto && hasCredentials && !userConfirmed){

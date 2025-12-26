@@ -351,7 +351,33 @@ export class RaydiumSwapService {
       const outDecimal = is_buy ? decimal : 9;
       // in_amount
       const amount = Number(((_amount - fee) * 10 ** inDecimal).toFixed(0));
-      const wallet = Keypair.fromSecretKey(bs58.decode(pk));
+      // Accept multiple secret key encodings: base58 64/32 bytes, JSON array, or hex.
+      // Normalize to Uint8Array and use appropriate Keypair constructor.
+      let decodedKey: Uint8Array;
+      try {
+        if (typeof pk === 'string' && pk.trim().startsWith('[')) {
+          const arr = JSON.parse(pk);
+          decodedKey = Uint8Array.from(arr);
+        } else {
+          try {
+            decodedKey = bs58.decode(pk);
+          } catch (e) {
+            decodedKey = Uint8Array.from(Buffer.from(pk, 'hex'));
+          }
+        }
+      } catch (e) {
+        console.error('[RaydiumSwapService] failed to decode secret key', e);
+        throw e;
+      }
+
+      let wallet: Keypair;
+      if (decodedKey.length === 64) {
+        wallet = Keypair.fromSecretKey(decodedKey);
+      } else if (decodedKey.length === 32) {
+        wallet = Keypair.fromSeed(decodedKey);
+      } else {
+        throw new Error(`Invalid secret key size: ${decodedKey.length}`);
+      }
 
       const poolinfo = await RaydiumTokenService.findLastOne({ mint });
       console.log('[RaydiumSwapService] poolinfo lookup result for', mint, poolinfo ? { mint: poolinfo.mint, poolId: poolinfo.poolId, isAmm: poolinfo.isAmm } : null);

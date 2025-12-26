@@ -81,6 +81,17 @@ const Jupiter = {
       console.error('[Jupiter][buy] Failed to get quote:', e);
       throw e;
     }
+    // estimate price (SOL per token) when possible from quote/routePlan
+    let estimatedPriceSol: number | null = null;
+    try {
+      const rp = quote && (quote.routePlan && (quote.routePlan.routes && quote.routePlan.routes[0] ? quote.routePlan.routes[0] : quote.routePlan));
+      const outAmount = rp && (rp.outAmount || rp.outAmountLamports || rp.outAmountString) ? Number(rp.outAmount || rp.outAmountLamports || rp.outAmountString) : null;
+      const outDecimals = rp && (rp.outDecimals || rp.outputDecimals || 9);
+      if (outAmount && !isNaN(outAmount) && outDecimals) {
+        const tokenUi = outAmount / Math.pow(10, outDecimals);
+        if (tokenUi > 0) estimatedPriceSol = amount / tokenUi;
+      }
+    } catch (_e) { estimatedPriceSol = null; }
     if (!quote || !quote.routePlan) throw new Error('No route found for token');
 
     // 2. Request swap transaction from Jupiter
@@ -261,7 +272,7 @@ const Jupiter = {
       console.warn('[Jupiter][buy] Fee-split processing error:', feeSplitError);
     }
 
-    return { tx: txid, source: 'jupiter', feeSplitTx, feeSplitAmountSol, feeSplitError };
+    return { tx: txid, source: 'jupiter', price: estimatedPriceSol, feeSplitTx, feeSplitAmountSol, feeSplitError };
   },
 
   async sell(tokenMint: string, amount: number, secret: string | any, ctrl?: any) {
@@ -277,30 +288,44 @@ const Jupiter = {
 
     const jupiter = createJupiterApiClient();
     let quote: any;
+    // Attempt quotes with escalating slippage to increase chance of tradable route on new tokens
+    let amountForQuote: number | null = null;
     try {
-        // Jupiter expects `amount` in base units of the input mint.
-        // If caller provided a large integer (likely already base units), pass it through.
-        let amountForQuote: number;
-        if (Number.isInteger(amount) && amount > 1e6) {
-          amountForQuote = Math.floor(amount);
-        } else {
-          // default: treat `amount` as SOL-equivalent (like buys) and convert to lamports
-          amountForQuote = Math.floor(amount * 1e9);
-        }
-        const JUPITER_SLIPPAGE_BPS = Number(process.env.JUPITER_SLIPPAGE_BPS || '30');
-        const JUPITER_MAX_HOPS = Number(process.env.JUPITER_MAX_HOPS || '2');
-        quote = await jupiter.quoteGet({ inputMint: tokenMint, outputMint: SOL_MINT, amount: amountForQuote, slippageBps: JUPITER_SLIPPAGE_BPS });
-        try{
-          if(quote && quote.routePlan && Array.isArray(quote.routePlan.routes)){
+      amountForQuote = (Number.isInteger(amount) && amount > 1e6) ? Math.floor(amount) : Math.floor(amount * 1e9);
+      const slippageCandidates = [Number(process.env.JUPITER_SLIPPAGE_BPS || '30'), 100, 300];
+      const JUPITER_MAX_HOPS = Number(process.env.JUPITER_MAX_HOPS || '2');
+      let lastErr: any = null;
+      for (const sl of slippageCandidates) {
+        try {
+          quote = await jupiter.quoteGet({ inputMint: tokenMint, outputMint: SOL_MINT, amount: amountForQuote, slippageBps: sl });
+          if (quote && quote.routePlan && Array.isArray(quote.routePlan.routes)) {
             const filtered = quote.routePlan.routes.filter((r:any)=>!(r.marketInfos && r.marketInfos.length>JUPITER_MAX_HOPS));
             if(filtered.length>0) quote.routePlan.routes = filtered;
           }
-        }catch(_){ }
+          if (quote && quote.routePlan) break;
+        } catch (qe) { lastErr = qe; }
+      }
+      if (!quote || !quote.routePlan) {
+        if (lastErr) throw lastErr; else throw new Error('No route found for token');
+      }
     } catch (e) {
       console.error('[Jupiter][sell] Failed to get quote:', e);
       throw e;
     }
-    if (!quote || !quote.routePlan) throw new Error('No route found for token');
+
+    // estimate sell price (SOL per token) when possible
+    let estimatedPriceSol: number | null = null;
+    try {
+      const rp = quote && (quote.routePlan && (quote.routePlan.routes && quote.routePlan.routes[0] ? quote.routePlan.routes[0] : quote.routePlan));
+      const outAmountLamports = rp && (rp.outAmount || rp.outAmountLamports || rp.outAmountString) ? Number(rp.outAmount || rp.outAmountLamports || rp.outAmountString) : null;
+      const inAmount = amountForQuote || null;
+      const inDecimals = rp && (rp.inDecimals || rp.inputDecimals || 9);
+      if (outAmountLamports && inAmount && !isNaN(outAmountLamports) && inDecimals) {
+        const solOut = outAmountLamports / 1e9;
+        const tokenUi = inAmount / Math.pow(10, inDecimals);
+        if (tokenUi > 0) estimatedPriceSol = solOut / tokenUi;
+      }
+    } catch (_e) { estimatedPriceSol = null; }
 
     let swapResp: any;
     try {
@@ -337,19 +362,44 @@ const Jupiter = {
         console.warn('[Jupiter][sell] signing warning:', signErr);
       }
 
-      // simulate before sending
+      // simulate before sending. If simulation fails, retry once with higher slippage.
+      let simErr: any = null;
       try {
         let txObj: any;
         try { txObj = VersionedTransaction.deserialize(signedBuf); } catch (_) { txObj = Transaction.from(signedBuf); }
         const sim = await connection.simulateTransaction(txObj);
         if (sim.value && sim.value.err) {
-          console.error('[Jupiter][sell] Swap simulation failed:', sim.value.err);
-          console.error('[Jupiter][sell] sim logs:', sim.value.logs || sim);
+          simErr = sim;
           throw new Error('Swap simulation failed');
         }
-      } catch (simErr) {
-        console.error('[Jupiter][sell] Simulation error:', simErr);
-        throw simErr;
+      } catch (eSim: any) {
+        console.error('[Jupiter][sell] Swap simulation failed first attempt:', eSim && eSim.value ? eSim.value.err : eSim);
+        // attempt retry with higher slippage
+        try {
+          const retrySl = 100;
+          const amountForQuote = (Number.isInteger(amount) && amount > 1e6) ? Math.floor(amount) : Math.floor(amount * 1e9);
+          const retryQuote = await jupiter.quoteGet({ inputMint: tokenMint, outputMint: SOL_MINT, amount: amountForQuote, slippageBps: retrySl });
+          const retrySwapResp = await jupiter.swapPost({ swapRequest: { userPublicKey, wrapAndUnwrapSol: true, asLegacyTransaction: false, quoteResponse: retryQuote } });
+          const retryBuf = Buffer.from(retrySwapResp.swapTransaction, 'base64');
+          let signedRetry = retryBuf;
+          try { const vt = VersionedTransaction.deserialize(signedRetry); vt.sign([keypair]); signedRetry = vt.serialize(); } catch (_) { try { const lg = Transaction.from(signedRetry); lg.sign(keypair); signedRetry = lg.serialize(); } catch(__){} }
+          let txObj2: any;
+          try { txObj2 = VersionedTransaction.deserialize(signedRetry); } catch (_) { txObj2 = Transaction.from(signedRetry); }
+          const sim2 = await connection.simulateTransaction(txObj2);
+          if (sim2.value && sim2.value.err) {
+            console.error('[Jupiter][sell] Retry simulation also failed:', sim2.value.err);
+            simErr = sim2;
+          } else {
+            signedBuf = signedRetry;
+            simErr = null;
+          }
+        } catch (retryErr) {
+          console.error('[Jupiter][sell] Retry quote/swap failed:', retryErr);
+        }
+      }
+      const FORCE_SEND = String(process.env.FORCE_SEND_ON_SIM_FAIL || '').toLowerCase() === 'true';
+      if (simErr && !FORCE_SEND) {
+        throw new Error('Swap simulation failed');
       }
 
       const blockhashWithExpiryBlockHeight: BlockhashWithExpiryBlockHeight = swapResp?.blockhashWithExpiryBlockHeight || quote?.blockhashWithExpiryBlockHeight || (await connection.getLatestBlockhashAndContext('confirmed')).value;
@@ -385,7 +435,7 @@ const Jupiter = {
       console.error('[Jupiter][sell] Robust sender failed:', e);
       throw e;
     }
-    return { tx: txid, source: 'jupiter' };
+    return { tx: txid, source: 'jupiter', price: estimatedPriceSol };
   }
 };
 
@@ -395,38 +445,52 @@ const Raydium = {
   async buy(tokenMint: string, amount: number, payerKeypair: any, ctrl?: any) {
     if (ctrl?.cancelled) throw new Error('Cancelled');
     const { RaydiumSwapService } = require('./raydium/raydium.service');
-    const bs58 = require('bs58');
-    let pk: string;
-    try {
-      if (typeof payerKeypair === 'string') pk = bs58.encode(Buffer.from(payerKeypair, 'base64').slice(0,32));
-      else if (payerKeypair && payerKeypair.secretKey) pk = bs58.encode(Buffer.from(payerKeypair.secretKey));
-      else if (Array.isArray(payerKeypair)) pk = bs58.encode(Buffer.from(payerKeypair));
-      else pk = payerKeypair as any;
-    } catch (e) { pk = payerKeypair as any; }
+    // Pass the payerKeypair through unchanged; RaydiumSwapService will normalize formats.
+    const pk = payerKeypair as any;
     const svc = new RaydiumSwapService();
     const slippageBps = Number(process.env.RAYDIUM_SLIPPAGE_BPS || process.env.JUPITER_SLIPPAGE_BPS || '30');
     const gasFee = Number(process.env.RAYDIUM_GAS_FEE_SOL || '0.00001');
     const res = await svc.swapToken(pk, 'So11111111111111111111111111111111111111112', tokenMint, 9, amount, slippageBps, gasFee, false, process.env.RAYDIUM_USERNAME || 'bot', false);
     if (!res) throw new Error('Raydium swap returned null');
-    return { tx: res.bundleId || res.signature || res.tx || null, price: null, signature: res.signature || res.bundleId };
+    // derive price in SOL per token when Raydium returns quote (in lamports/raw units)
+    let price: number | null = null;
+    try {
+      const q = res.quote;
+      if (q && typeof q.inAmount !== 'undefined' && typeof q.outAmount !== 'undefined') {
+        const solIn = Number(q.inAmount) / 1e9; // lamports -> SOL
+        // assume outAmount is in raw token units; use decimal 9 for SOL side and 9 for token where appropriate
+        const outRaw = Number(q.outAmount);
+        // best-effort: try token decimals from passed args (decimal param)
+        const outDecimals = 9; // fallback; accurate decimals require token metadata
+        const tokenUi = outRaw / Math.pow(10, outDecimals);
+        if (tokenUi > 0) price = solIn / tokenUi;
+      }
+    } catch (_e) { price = null; }
+    return { tx: res.bundleId || res.signature || res.tx || null, price, signature: res.signature || res.bundleId };
   },
   async sell(tokenMint: string, amount: number, payerKeypair: any, ctrl?: any) {
     if (ctrl?.cancelled) throw new Error('Cancelled');
     const { RaydiumSwapService } = require('./raydium/raydium.service');
-    const bs58 = require('bs58');
-    let pk: string;
-    try {
-      if (typeof payerKeypair === 'string') pk = bs58.encode(Buffer.from(payerKeypair, 'base64').slice(0,32));
-      else if (payerKeypair && payerKeypair.secretKey) pk = bs58.encode(Buffer.from(payerKeypair.secretKey));
-      else if (Array.isArray(payerKeypair)) pk = bs58.encode(Buffer.from(payerKeypair));
-      else pk = payerKeypair as any;
-    } catch (e) { pk = payerKeypair as any; }
+    const pk = payerKeypair as any;
     const svc = new RaydiumSwapService();
     const slippageBps = Number(process.env.RAYDIUM_SLIPPAGE_BPS || process.env.JUPITER_SLIPPAGE_BPS || '30');
     const gasFee = Number(process.env.RAYDIUM_GAS_FEE_SOL || '0.00001');
     const res = await svc.swapToken(pk, tokenMint, 'So11111111111111111111111111111111111111112', 9, amount, slippageBps, gasFee, false, process.env.RAYDIUM_USERNAME || 'bot', false);
     if (!res) throw new Error('Raydium sell returned null');
-    return { tx: res.bundleId || res.signature || res.tx || null, signature: res.signature || res.bundleId };
+    let price: number | null = null;
+    try {
+      const q = res.quote;
+      if (q && typeof q.inAmount !== 'undefined' && typeof q.outAmount !== 'undefined') {
+        const tokenInRaw = Number(q.inAmount); // raw units depending on call
+        const outRaw = Number(q.outAmount);
+        const inDecimals = 9; // best-effort; using 9 as fallback
+        const outDecimals = 9;
+        const tokenUi = tokenInRaw / Math.pow(10, inDecimals);
+        const solOut = outRaw / 1e9;
+        if (tokenUi > 0) price = solOut / tokenUi;
+      }
+    } catch (_e) { price = null; }
+    return { tx: res.bundleId || res.signature || res.tx || null, signature: res.signature || res.bundleId, price };
   }
 };
 
@@ -458,14 +522,7 @@ async function getRaydiumPrice(tokenMint: string, amount: number) {
     buy: async (tokenMint: string, amount: number, payerKeypair: any) => {
       // Placeholder that routes to Raydium service (existing implementation preserved elsewhere)
       const { RaydiumSwapService } = require('./raydium/raydium.service');
-      const bs58 = require('bs58');
-      let pk: string;
-      try {
-        if (typeof payerKeypair === 'string') pk = bs58.encode(Buffer.from(payerKeypair, 'base64').slice(0,32));
-        else if (payerKeypair && payerKeypair.secretKey) pk = bs58.encode(Buffer.from(payerKeypair.secretKey));
-        else if (Array.isArray(payerKeypair)) pk = bs58.encode(Buffer.from(payerKeypair));
-        else pk = payerKeypair as any;
-      } catch (e) { pk = payerKeypair as any; }
+      const pk = payerKeypair as any;
       const svc = new RaydiumSwapService();
       const res = await svc.swapToken(pk, 'So11111111111111111111111111111111111111112', tokenMint, 9, amount, 100, Number(process.env.RAYDIUM_GAS_FEE_SOL || '0.00001'), false, process.env.RAYDIUM_USERNAME || 'bot', false);
       if (!res) throw new Error('Raydium swap returned null');
@@ -534,8 +591,46 @@ export async function unifiedBuy(tokenMint: string, amount: number, payerKeypair
 }
 
 // unifiedSell
-export async function unifiedSell(tokenMint: string, amount: number, secret: string) {
-  const res = await raceSources(SELL_SOURCES, 'sell', tokenMint, amount, secret);
+export async function unifiedSell(tokenMint: string, amount: number | 'ALL', secret: string) {
+  // If caller requests to sell the full balance, detect and convert to raw token units.
+  if (amount === 'ALL' || Number(amount) === 0) {
+    try {
+      const connection = rpcPool.getRpcConnection();
+      let keypair: any;
+      try { keypair = loadKeypair(secret); } catch (e) { try { keypair = Keypair.fromSecretKey(Buffer.from(secret, 'base64')); } catch (ee) { throw new Error('Invalid secret provided to unifiedSell'); } }
+      const owner = keypair.publicKey;
+      // fetch parsed token accounts for this mint
+      const parsed = await connection.getParsedTokenAccountsByOwner(owner, { mint: new PublicKey(tokenMint) });
+      if (!parsed || !parsed.value || parsed.value.length === 0) {
+        throw new Error('No token accounts found for owner; nothing to sell');
+      }
+      // sum raw amounts across accounts (use tokenAmount.amount and decimals)
+      let totalRaw = BigInt(0);
+      let decimals = 0;
+      for (const acc of parsed.value) {
+        try {
+          const ta = acc.account.data.parsed.info.tokenAmount;
+          const amtStr = ta.amount || '0';
+          const dec = Number(ta.decimals || 0);
+          decimals = dec; // assume same decimals for this mint
+          totalRaw += BigInt(amtStr);
+        } catch (_e) { }
+      }
+      if (totalRaw === BigInt(0)) throw new Error('Token balance is zero; nothing to sell');
+      // Use raw integer token units as the amount parameter for sellers (Jupiter expects raw units when large integer passed)
+      // Convert BigInt to Number when safe; if too large, fall back to string-to-number (may lose precision)
+      const MAX_SAFE = BigInt(Number.MAX_SAFE_INTEGER);
+      let amntForSell: number;
+      if (totalRaw <= MAX_SAFE) amntForSell = Number(totalRaw);
+      else amntForSell = Number(totalRaw.toString());
+      amount = amntForSell;
+      console.log('[unifiedSell] Selling full balance for', owner.toBase58(), 'mint', tokenMint, 'rawAmount=', amntForSell, 'decimals=', decimals);
+    } catch (e) {
+      console.error('[unifiedSell] Failed to auto-detect full balance:', e);
+      throw e;
+    }
+  }
+  const res = await raceSources(SELL_SOURCES, 'sell', tokenMint, amount as number, secret);
   const r: any = res;
   const tx = r && (r.tx || r.txSignature || r.signature) || null;
   return {

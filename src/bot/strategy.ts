@@ -144,7 +144,11 @@ export function registerBuyWithTarget(user: any, token: any, buyResult: any, tar
       });
     }
   }
-  fs.writeFileSync(userFile, JSON.stringify(userTrades, null, 2));
+  // Only persist trade history if archival is explicitly enabled
+  try{
+    const ENABLE_ARCHIVE = String(process.env.ENABLE_ARCHIVE || '').toLowerCase() === 'true';
+    if(ENABLE_ARCHIVE){ fs.writeFileSync(userFile, JSON.stringify(userTrades, null, 2)); }
+  }catch(_){ }
 }
 /**
  * مراقبة صفقات الشراء للمستخدم وتنفيذ البيع تلقائياً عند تحقق الشروط
@@ -208,12 +212,12 @@ export async function monitorAndAutoSellTrades(user: any, tokens: any[], priceFi
         sell.fee = fee;
         sell.slippage = slippage;
         sell.executedTime = Date.now();
-        fs.writeFileSync(userFile, JSON.stringify(userTrades, null, 2));
+        try{ const ENABLE_ARCHIVE = String(process.env.ENABLE_ARCHIVE || '').toLowerCase() === 'true'; if(ENABLE_ARCHIVE){ fs.writeFileSync(userFile, JSON.stringify(userTrades, null, 2)); } }catch(_){ }
       } catch (e) {
         sell.status = 'fail';
         sell.error = (e instanceof Error ? e.message : String(e));
         sell.executedTime = Date.now();
-        fs.writeFileSync(userFile, JSON.stringify(userTrades, null, 2));
+        try{ const ENABLE_ARCHIVE = String(process.env.ENABLE_ARCHIVE || '').toLowerCase() === 'true'; if(ENABLE_ARCHIVE){ fs.writeFileSync(userFile, JSON.stringify(userTrades, null, 2)); } }catch(_){ }
       }
     }
   }

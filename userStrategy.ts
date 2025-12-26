@@ -22,14 +22,17 @@ export function recordUserTrade(userId: string, trade: any) {
     return;
   }
   const sentTokensDir = path.join(process.cwd(), 'sent_tokens');
-  if (!fs.existsSync(sentTokensDir)) fs.mkdirSync(sentTokensDir);
+  try{
+    const ENABLE_ARCHIVE = String(process.env.ENABLE_ARCHIVE || '').toLowerCase() === 'true';
+    if(ENABLE_ARCHIVE){ if (!fs.existsSync(sentTokensDir)) fs.mkdirSync(sentTokensDir); }
+  }catch(_){ }
   const userFile = path.join(sentTokensDir, `${userId}.json`);
   let userTrades: any[] = [];
   if (fs.existsSync(userFile)) {
     try { userTrades = JSON.parse(fs.readFileSync(userFile, 'utf8')); } catch {}
   }
   userTrades.push({ ...trade, time: Date.now() });
-  fs.writeFileSync(userFile, JSON.stringify(userTrades, null, 2));
+  try{ const ENABLE_ARCHIVE = String(process.env.ENABLE_ARCHIVE || '').toLowerCase() === 'true'; if(ENABLE_ARCHIVE){ fs.writeFileSync(userFile, JSON.stringify(userTrades, null, 2)); } }catch(_){ }
 }
 // userStrategy.ts
 require('dotenv').config();

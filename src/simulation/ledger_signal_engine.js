@@ -22,6 +22,8 @@ const BIT_CREATOR_EXPOSED = 1 << (LEDGER_BIT_BASE_SHIFT + 8);// Creator funded v
 const BIT_SOLLET_CREATED = 1 << (LEDGER_BIT_BASE_SHIFT + 9); // Sollet-style initialize detected
 const metrics = require('./fsm_metrics_logger');
 
+const DBG = !!(process && process.env && (process.env.DEBUG_LEDGER_ENGINE === '1' || process.env.DEBUG_LEDGER_ENGINE === 'true'));
+
 class LedgerSignalEngine {
   constructor(opts = {}){
     this.windowSlots = Number(opts.windowSlots || DEFAULT_WINDOW_SLOTS);
@@ -202,6 +204,9 @@ class LedgerSignalEngine {
         }
 
         if(arr.length) this.slotTransfers.set(Number(slot), arr);
+        if(DBG && arr && arr.length){
+          try{ console.log('[LEDGER_DBG] processEvent slot', Number(slot), 'transfers_count', arr.length, 'sample_transfers', arr.slice(0,6)); }catch(_e){}
+        }
       }catch(_e){}
 
           for(const m of fresh){
@@ -316,6 +321,13 @@ class LedgerSignalEngine {
         for(const s of this.slotOrder){ const b = this.slotBuckets.get(s); if(!b) continue; const ent = b.mints.get(key); if(ent && ent.seenSlots && ent.seenSlots.size){ for(const ss of ent.seenSlots){ const n = Number(ss); if(minS===null||n<minS) minS=n; if(maxS===null||n>maxS) maxS=n; } } }
         if(minS!==null && maxS!==null && (maxS - minS) <= 2) mask |= BIT_SLOT_ALIGNED;
       }catch(_e){}
+      if(DBG){
+        try{
+          const perSlot = {};
+          for(const s of this.slotOrder){ const arr = this.slotTransfers.get(s) || []; perSlot[s] = arr.filter(t => (t.to === key || t.from === key || (t.raw && String(t.raw).includes(key)))).length; }
+          console.log('[LEDGER_DBG] getMaskForMint', key, 'mask', mask, 'perSlotCounts', perSlot, 'slotOrder', this.slotOrder.slice());
+        }catch(_e){}
+      }
       return mask;
     }catch(e){ return 0; }
   }

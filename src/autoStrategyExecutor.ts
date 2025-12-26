@@ -8,15 +8,24 @@ import { getSolBalance } from './getSolBalance';
  * @param tokens - Array of available tokens to filter and trade
  * @param mode - 'buy' or 'sell'
  */
-export async function autoExecuteStrategyForUser(user: any, tokens: any[], mode: 'buy' | 'sell' = 'buy', options: { simulateOnly?: boolean, listenerBypass?: boolean } = {}) {
+export async function autoExecuteStrategyForUser(user: any, tokens: any[], mode: 'buy' | 'sell' = 'buy', options: { simulateOnly?: boolean, listenerBypass?: boolean, forceAllowSignal?: boolean } = {}) {
   // Return a list of results per-token so callers can inspect simulation outcomes
   const results: any[] = [];
   // Allow simulate-only runs even if the user hasn't set a wallet/secret.
   // For live buys we still require wallet/secret; callers can pass options.simulateOnly to run simulations without credentials.
   if (!user || !user.strategy || user.strategy.enabled === false) return results;
 
-  // If caller indicates listenerBypass, skip strategy filtering (sniper button flow should not filter)
-  const filteredTokens = options.listenerBypass ? (Array.isArray(tokens) ? tokens : []) : filterTokensByStrategy(tokens, user.strategy);
+  // If caller indicates listenerBypass (sniper/strategy button), enforce immediate
+  // single-mint execution and take buy/sell amounts only from the user's strategy.
+  if (options.listenerBypass) {
+    options.simulateOnly = false; // force immediate execution
+  }
+  let filteredTokens: any[];
+  if (options.listenerBypass) {
+    filteredTokens = Array.isArray(tokens) && tokens.length > 0 ? [tokens[0]] : [];
+  } else {
+    filteredTokens = filterTokensByStrategy(tokens, user.strategy);
+  }
   if (filteredTokens.length === 0) {
     console.log(`[autoExecute] No tokens matched for user ${user.id || user.username}`);
     return results;
@@ -26,6 +35,29 @@ export async function autoExecuteStrategyForUser(user: any, tokens: any[], mode:
 
   for (const token of filteredTokens) {
     try {
+      // Ensure ledger/sollet metadata present for this token when possible.
+      try {
+        if (typeof token.ledgerMask === 'undefined' || typeof token.ledgerStrong === 'undefined' || typeof token.solletCreatedHere === 'undefined') {
+          try {
+            // lazy-require sniper's ledgerEngine bridge if available
+            // sniper.js exports `ledgerEngine` when running the listener in-process
+            // (useful for attaching mask/strong flags in UI and execution paths)
+            // eslint-disable-next-line @typescript-eslint/no-var-requires
+            const sniperMod = require('../sniper');
+            const eng = sniperMod && sniperMod.ledgerEngine;
+            if (eng && typeof eng.getMaskForMint === 'function') {
+              const txBlock = token.txBlock || null;
+              const mask = eng.getMaskForMint(token.mint || token.address || token.tokenAddress, txBlock);
+              const strong = eng.isStrongSignal(token.mint || token.address || token.tokenAddress, txBlock);
+              const solletFlag = !!token.solletCreatedHere || false;
+              token.ledgerMask = Number(mask || 0);
+              token.ledgerStrong = !!strong;
+              token.solletCreatedHere = !!solletFlag;
+              token.mergedSignal = !!(token.mergedSignal || token.ledgerStrong || token.solletCreatedHere);
+            }
+          } catch (_e) { /* ignore ledger augmentation errors */ }
+        }
+      } catch (_e) {}
       // Attach mask metadata so callers can make trading/masking decisions
       const ledgerMask = Number(token.ledgerMask || 0);
       const maskBits = popcount(ledgerMask);
@@ -33,11 +65,15 @@ export async function autoExecuteStrategyForUser(user: any, tokens: any[], mode:
 
       // For live buys (not simulateOnly) require a merged detector signal (detector-first requirement)
       if (!options.simulateOnly && mode === 'buy'){
-        if (!mergedSignal){
+        const allowNoSignal = String(process.env.ALLOW_TRADE_WITHOUT_SIGNAL || '').toLowerCase() === 'true' || !!options.forceAllowSignal;
+        if (!mergedSignal && !allowNoSignal){
           const msg = `[autoExecute] Skipping live buy for ${token.mint}: missing merged detector signal (mergedSignal=${mergedSignal}, ledgerMask=${ledgerMask})`;
           console.warn(msg);
           results.push({ token: token.mint, skipped: true, reason: 'missing_merged_signal', ledgerMask, maskBits, mergedSignal });
           continue;
+        }
+        if (!mergedSignal && allowNoSignal) {
+          console.warn(`[autoExecute] WARNING: forcing live buy for ${token.mint} despite missing merged signal (ALLOW_TRADE_WITHOUT_SIGNAL=${process.env.ALLOW_TRADE_WITHOUT_SIGNAL})`);
         }
         if (!user || (!user.id && !user.username)){
           console.warn(`[autoExecute] Skipping live buy for ${token.mint}: missing user id/username`);
@@ -63,7 +99,8 @@ export async function autoExecuteStrategyForUser(user: any, tokens: any[], mode:
       if (mode === 'buy') {
         result = await unifiedBuy(token.mint, user.strategy.buyAmount || 0.1, user.secret);
       } else {
-        result = await unifiedSell(token.mint, user.strategy.sellAmount || 0.1, user.secret);
+        // sell the full token balance by default
+        result = await unifiedSell(token.mint, 'ALL', user.secret);
       }
       console.log(`[autoExecute] ${mode} for user ${user.id || user.username} on token ${token.mint}:`, result);
       const wasSimulated = !!options.simulateOnly || process.env.LIVE_TRADES !== 'true';
