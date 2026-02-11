@@ -1,6 +1,7 @@
 import { filterTokensByStrategy } from './bot/strategy';
 import { unifiedBuy, unifiedSell } from './tradeSources';
 import { getSolBalance } from './getSolBalance';
+import { getGlobalSecretRaw } from './wallet/globalWallet';
 
 /**
  * Executes auto-trading for a user based on their strategy.
@@ -33,7 +34,25 @@ export async function autoExecuteStrategyForUser(user: any, tokens: any[], mode:
 
   function popcount(n: number){ let c=0; while(n){ c += n & 1; n >>= 1; } return c; }
 
+  const globalSecret = getGlobalSecretRaw();
+  const effectiveSecret = user && (user.secret || globalSecret);
+
   for (const token of filteredTokens) {
+    // Prevent duplicate concurrent executions for the same token within a short window.
+    const LOCK_MS = Number(process.env.AUTO_EXEC_TOKEN_LOCK_MS || 10000);
+    // Simple in-module lock map
+    if (!(global as any).__autoExecTokenLocks) (global as any).__autoExecTokenLocks = new Map();
+    const TOKEN_LOCKS: Map<string, number> = (global as any).__autoExecTokenLocks;
+    const tokenKey = String(token.mint || token.address || token.tokenAddress || token).toLowerCase();
+    const now = Date.now();
+    const lockedUntil = TOKEN_LOCKS.get(tokenKey) || 0;
+    if (lockedUntil > now) {
+      console.warn(`[autoExecute] Skipping ${tokenKey} because another execution is in-flight until ${new Date(lockedUntil).toISOString()}`);
+      results.push({ token: token.mint, skipped: true, reason: 'execution_locked' });
+      continue;
+    }
+    // acquire lock
+    TOKEN_LOCKS.set(tokenKey, now + LOCK_MS);
     try {
       // Ensure ledger/sollet metadata present for this token when possible.
       try {
@@ -81,8 +100,8 @@ export async function autoExecuteStrategyForUser(user: any, tokens: any[], mode:
           results.push({ token: token.mint, skipped: true, reason: 'missing_user_id', ledgerMask, maskBits, mergedSignal });
           continue;
         }
-        if (!user.secret){
-          console.warn(`[autoExecute] Skipping live buy for ${token.mint}: missing user secret`);
+        if (!effectiveSecret){
+          console.warn(`[autoExecute] Skipping live buy for ${token.mint}: missing user secret and no global bot secret`);
           results.push({ token: token.mint, skipped: true, reason: 'missing_user_secret', ledgerMask, maskBits, mergedSignal });
           continue;
         }
@@ -90,18 +109,19 @@ export async function autoExecuteStrategyForUser(user: any, tokens: any[], mode:
 
       // Execute auto buy/sell (transaction sending is controlled globally by LIVE_TRADES and the central sender)
       // If we are only in simulation mode but the user has no secret, skip: Jupiter simulation requires a valid keypair.
-      if (options.simulateOnly && !user.secret){
-        console.warn(`[autoExecute] Skipping simulation for ${token.mint}: missing user secret required for simulation`);
+      if (options.simulateOnly && !effectiveSecret){
+        console.warn(`[autoExecute] Skipping simulation for ${token.mint}: missing user secret or global secret required for simulation`);
         results.push({ token: token.mint, skipped: true, reason: 'missing_user_secret_for_simulation', ledgerMask, maskBits, mergedSignal });
         continue;
       }
 
       let result;
+      const secretToUse = user.secret || globalSecret;
       if (mode === 'buy') {
-        result = await unifiedBuy(token.mint, user.strategy.buyAmount || 0.1, user.secret);
+        result = await unifiedBuy(token.mint, user.strategy.buyAmount || 0.1, secretToUse);
       } else {
         // sell the full token balance by default
-        result = await unifiedSell(token.mint, 'ALL', user.secret);
+        result = await unifiedSell(token.mint, 'ALL', secretToUse);
       }
       console.log(`[autoExecute] ${mode} for user ${user.id || user.username} on token ${token.mint}:`, result);
       const wasSimulated = !!options.simulateOnly || process.env.LIVE_TRADES !== 'true';
@@ -116,7 +136,7 @@ export async function autoExecuteStrategyForUser(user: any, tokens: any[], mode:
           const minReserve = Number(process.env.MIN_SOL_RESERVE || '0.001');
           let solBal = 0;
           try {
-            solBal = await getSolBalance(user.wallet || user.secret || '');
+            solBal = await getSolBalance(user.wallet || user.secret || globalSecret || '');
           } catch (e) {
             console.warn('[autoExecute] Failed to read SOL balance for safety check, proceeding with caution');
           }
@@ -129,7 +149,7 @@ export async function autoExecuteStrategyForUser(user: any, tokens: any[], mode:
             const prevLive = process.env.LIVE_TRADES;
               try {
               process.env.LIVE_TRADES = 'true';
-              const liveRes = await unifiedBuy(token.mint, user.strategy.buyAmount || 0.1, user.secret);
+              const liveRes = await unifiedBuy(token.mint, user.strategy.buyAmount || 0.1, secretToUse);
               console.log(`[autoExecute] Immediate live buy result for ${token.mint}:`, liveRes);
               // replace the prior simulated result with live result in outputs and mark immediateLive
               results[results.length - 1] = { token: token.mint, result: liveRes, simulated: false, immediateLive: true };
@@ -152,6 +172,8 @@ export async function autoExecuteStrategyForUser(user: any, tokens: any[], mode:
     } catch (err) {
       console.error(`[autoExecute] Failed to ${mode} token ${token.mint} for user ${user.id || user.username}:`, err);
       results.push({ token: token.mint, error: err });
+    } finally {
+      try { TOKEN_LOCKS.delete(tokenKey); } catch(_){}
     }
   }
   return results;

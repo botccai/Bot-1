@@ -832,12 +832,18 @@ let lastCacheUpdate = 0;
 const CACHE_TTL = 1000 * 60 * 2;
 let boughtTokens: Record<string, Set<string>> = {};
 const restoreStates: Record<string, boolean> = {};
+// Awaiting mint addresses for auto-trade flow per-user
+const awaitingAutoToken: Map<string, boolean> = new Map();
+// Track running auto-traders to prevent duplicates
+const runningAutoTraders: Map<string, { stop: boolean }> = new Map();
+// Pending force-confirm map: userId -> mint awaiting explicit CONFIRM BUY
+const pendingForceConfirm: Map<string, string> = new Map();
 
 function getMainReplyKeyboard(userId?: string) {
   // Use the exact translated labels for the main keyboard (no additions or counts)
   return Markup.keyboard([
     [t('main.wallet', userId), t('main.strategy', userId)],
-    [t('main.show_tokens', userId), t('main.invite_friends', userId)],
+    [t('main.auto_trade', userId), t('main.invite_friends', userId)],
     [t('main.sniper', userId), t('main.sniper_cex', userId)],
     [t('main.language', userId)]
   ]).resize();
@@ -1100,10 +1106,12 @@ bot.on('text', async (ctx, next) => {
     const field = STRATEGY_FIELDS[0];
     return await ctx.reply(t('strategy.field_prompt', userId, { label: field.label, optional: field.optional ? ' (optional)' : '' }));
   }
-  // show tokens
-  if (matchesLabel(text, 'main.show_tokens', userId)) {
-    console.log(`[📊 Show Tokens] User: ${String(ctx.from?.id)}`);
-    return ctx.reply(t('main.show_tokens_help', userId));
+  // auto trade (keyboard-level) — ask for mint and set awaiting flag
+  if (matchesLabel(text, 'main.auto_trade', userId)) {
+    console.log(`[🤖 Auto Trade] User: ${String(ctx.from?.id)}`);
+    // mark that we are awaiting a mint from this user
+    awaitingAutoToken.set(userId, true);
+    return ctx.reply(t('main.auto_trade_help', userId) + "\n\n" + 'أدخل عنوان المينت (token mint) لتشغيل التداول الآلي، أو أرسل /cancel لإلغاء.');
   }
   // invite friends
   if (matchesLabel(text, 'main.invite_friends', userId)) {
@@ -1118,6 +1126,13 @@ bot.on('text', async (ctx, next) => {
     const rows: any[] = [];
     for (let i = 0; i < buttons.length; i += 2) rows.push(buttons.slice(i, i + 2));
     return ctx.reply(t('main_extra.choose_language', userId), { reply_markup: { inline_keyboard: rows } } as any);
+  }
+
+  // Auto-trade button (keyboard) without mint: ask user to provide a mint
+  // Note: token-card buttons send `auto_trade_<mint>` which is handled below.
+  // Here we handle the keyboard-level Auto Trade button.
+  if (matchesLabel(text, 'main.auto_trade', userId)) {
+    // handled earlier in text router; this block is intentionally left for clarity
   }
   // Sniper CEX button — match exact translated label only
   if (matchesLabel(text, 'main.sniper_cex', userId)) {
@@ -1621,6 +1636,123 @@ bot.action(/sell_(.+)/, async (ctx: any) => {
   }
 });
 
+// Start Automatic Trading flow (keyboard-level button)
+bot.action('auto_trade', async (ctx: any) => {
+  const userId = String(ctx.from?.id);
+  users = loadUsers();
+  const user = users[userId];
+  if (!user || !user.secret) {
+    await ctx.reply('❌ الرجاء تفعيل محفظتك أو إعداد السرّ أولاً.');
+    return;
+  }
+  awaitingAutoToken.set(userId, true);
+  await ctx.reply('أدخل عنوان المينت (token mint) لتشغيل التداول الآلي، أو أرسل /cancel لإلغاء.');
+});
+
+// Support auto_trade with token passed in callback data: auto_trade_<mint>
+bot.action(/^auto_trade_(.+)/, async (ctx: any) => {
+  const userId = String(ctx.from?.id);
+  users = loadUsers();
+  const user = users[userId];
+  // If user has no strategy or it's disabled, create a temporary default strategy
+  if (!user) {
+    await ctx.reply('❌ لم يتم العثور على ملف المستخدم. تأكد من تشغيل /start ثم جرّب مرة أخرى.');
+    return;
+  }
+  let usedUser = user;
+  if (!user.strategy || user.strategy.enabled === false) {
+    const fallbackBuy = Number(process.env.DEFAULT_BUY_AMOUNT || 0.01);
+    const fallbackTarget = Number(process.env.DEFAULT_TARGET_PERCENT || 10);
+    const tempStrat = { buyAmount: fallbackBuy, targetPercent: fallbackTarget, enabled: true };
+    usedUser = { ...user, strategy: tempStrat };
+    await ctx.reply(`ℹ️ لم يتم العثور على استراتيجية محفوظة — سيتم استخدام إعداد افتراضي مؤقت: buyAmount=${fallbackBuy} SOL, targetPercent=${fallbackTarget}% (محاكاة ما لم يكن LIVE_TRADES=true).`);
+  }
+  // Ensure usedUser has an id/username so autoExecute can run live buys
+  try { if (!usedUser.id && !usedUser.username) usedUser.id = userId; } catch (_) {}
+  const mint = ctx.match && ctx.match[1] ? ctx.match[1] : null;
+  if (!mint) { await ctx.reply('❌ لا يمكن استخلاص عنوان المينت من الزر.'); return; }
+  await ctx.reply(`🔁 تشغيل التداول الآلي للرمز: ${mint} (جارٍ المعالجة...)`);
+  try {
+    const simulateOnly = process.env.LIVE_TRADES !== 'true';
+    const tokens = [{ mint }];
+    const res = await autoExecuteStrategyForUser(usedUser, tokens, 'buy', { simulateOnly: simulateOnly, listenerBypass: true });
+    await ctx.reply(`✅ Auto Trade finished for ${mint}. Results: ${JSON.stringify(res)}`);
+    // If skipped due to missing merged signal, prompt for explicit confirmation to force trade
+    try {
+      const first = Array.isArray(res) && res.length ? res[0] : null;
+      if (first && first.skipped && first.reason === 'missing_merged_signal') {
+        await ctx.reply(`⚠️ لم يتم تنفيذ الشراء الآلي لأن الرمز لا يمتلك إشارة مجمعة (merged signal). إذا كنت متأكدًا وترغب في المتابعة، اكتب: CONFIRM BUY ${mint}`);
+        pendingForceConfirm.set(String(ctx.from?.id), mint);
+      }
+    } catch (e) { /* ignore */ }
+  } catch (e:any) {
+    console.error('[auto_trade callback] error', e);
+    await ctx.reply('❌ خطأ أثناء تشغيل التداول الآلي: ' + (e && e.message ? e.message : String(e)));
+  }
+});
+
+// Capture mint text replies when awaitingAutoToken is set
+bot.on('text', async (ctx: any, next: any) => {
+  const userId = String(ctx.from?.id);
+  // Check for explicit force-confirm command first: "CONFIRM BUY <mint>"
+  const textRaw = (ctx.message && ctx.message.text || '').trim();
+  const mConfirm = String(textRaw || '').match(/^\s*CONFIRM\s+BUY\s+(.+)$/i);
+  if (mConfirm) {
+    const mintToConfirm = mConfirm[1].trim();
+    const pending = pendingForceConfirm.get(userId);
+    if (!pending || pending !== mintToConfirm) {
+      await ctx.reply('❌ لا يوجد تأكيد معلق لهذا المينت. تأكد من كتابة CONFIRM BUY <same_mint> بعد تلقي رسالة التأكيد.');
+      return;
+    }
+    pendingForceConfirm.delete(userId);
+    users = loadUsers();
+    const user = users[userId];
+    if (!user) { await ctx.reply('❌ لم يتم العثور على معلومات المستخدم.'); return; }
+    await ctx.reply(`🔁 تنفيذ شراء مؤكد ل: ${mintToConfirm} (ستفرض تجاوز شرط الإشارة)`);
+    try {
+      const simulateOnly = process.env.LIVE_TRADES !== 'true';
+      const tokens = [{ mint: mintToConfirm }];
+      const resForce = await autoExecuteStrategyForUser(user, tokens, 'buy', { simulateOnly: simulateOnly, listenerBypass: true, forceAllowSignal: true });
+      await ctx.reply(`✅ Force-Auto Trade finished for ${mintToConfirm}. Results: ${JSON.stringify(resForce)}`);
+    } catch (e:any) {
+      console.error('[auto_trade force confirm] error', e);
+      await ctx.reply('❌ خطأ أثناء تنفيذ التأكيد: ' + (e && e.message ? e.message : String(e)));
+    }
+    return;
+  }
+
+  if (!awaitingAutoToken.get(userId)) {
+    if (typeof next === 'function') return next();
+    return;
+  }
+  awaitingAutoToken.delete(userId);
+  const mint = (ctx.message && ctx.message.text || '').trim();
+  if (!mint) { await ctx.reply('❌ عنوان المينت غير صالح.'); return; }
+  users = loadUsers();
+  const user = users[userId];
+  if (!user || !user.strategy) { await ctx.reply('❌ الرجاء إعداد استراتيجية أولاً باستخدام /strategy'); return; }
+  await ctx.reply(`🔁 تشغيل التداول الآلي للرمز: ${mint} (جارٍ المعالجة...)`);
+  try {
+    const simulateOnly = process.env.LIVE_TRADES !== 'true';
+    const tokens = [{ mint }];
+    // If user has no strategy, provide a temporary default
+    let usedUser2 = user;
+    if (!user.strategy || user.strategy.enabled === false) {
+      const fallbackBuy = Number(process.env.DEFAULT_BUY_AMOUNT || 0.01);
+      const fallbackTarget = Number(process.env.DEFAULT_TARGET_PERCENT || 10);
+      const tempStrat = { buyAmount: fallbackBuy, targetPercent: fallbackTarget, enabled: true };
+      usedUser2 = { ...user, strategy: tempStrat };
+      await ctx.reply(`ℹ️ لم يتم العثور على استراتيجية محفوظة — سيتم استخدام إعداد افتراضي مؤقت: buyAmount=${fallbackBuy} SOL, targetPercent=${fallbackTarget}% (محاكاة ما لم يكن LIVE_TRADES=true).`);
+    }
+    try { if (!usedUser2.id && !usedUser2.username) usedUser2.id = userId; } catch (_) {}
+    const res = await autoExecuteStrategyForUser(usedUser2, tokens, 'buy', { simulateOnly: simulateOnly, listenerBypass: true });
+    await ctx.reply(`✅ Auto Trade finished for ${mint}. Results: ${JSON.stringify(res)}`);
+  } catch (e:any) {
+    console.error('[auto_trade text reply] error', e);
+    await ctx.reply('❌ خطأ أثناء تشغيل التداول الآلي: ' + (e && e.message ? e.message : String(e)));
+  }
+});
+
 
 bot.command('wallet', async (ctx) => {
   console.log(`[wallet] User: ${String(ctx.from?.id)}`);
@@ -1806,7 +1938,7 @@ bot.on('text', async (ctx, next) => {
               users[userId].strategy = { ...state.values, ...state.tradeSettings, enabled: true };
               saveUsers(users);
               delete userStrategyStates[userId];
-              await ctx.reply('✅ Strategy and trade settings saved successfully! You can now press "📊 Show Tokens" to see matching tokens and trades.');
+              await ctx.reply('✅ Strategy and trade settings saved successfully! You can now press "🤖 التداول الآلي" (Auto Trade) to see matching tokens and trades.');
             }
             return;
           }
@@ -1902,116 +2034,7 @@ bot.on('text', async (ctx, next) => {
         }
         let summary = `<b>Auto Buy Summary</b>\n------------------------------\n✅ Success: <b>${successCount}</b>\n❌ Failed: <b>${failCount}</b>\n------------------------------`;
   await ctx.reply(summary + '\n' + buyResults.join('\n'), { parse_mode: 'HTML' });
-// Handle Buy/Sell actions from show_token
-bot.action(/showtoken_buy_(.+)/, async (ctx) => {
-  const userId = String(ctx.from?.id);
-  // reload users from disk to pick up any runtime changes to strategy/wallet
-  users = loadUsers();
-  const user = users[userId];
-  const tokenAddress = ctx.match[1];
-  console.log(`[showtoken_buy] User: ${userId}, Token: ${tokenAddress}`);
-  if (!user || !hasWallet(user) || !user.strategy || !user.strategy.enabled) {
-    await ctx.reply('❌ No active strategy or wallet found.');
-    return;
-  }
-  try {
-    const amount = user.strategy.buyAmount || 0.01;
-    // Validate mergedSignal (sollet+ledger) when available to avoid accidental buys
-    try{
-      const sniperMod = require('./sniper.js');
-      const eng = sniperMod && sniperMod.ledgerEngine ? sniperMod.ledgerEngine : null;
-      let mergedOk = false;
-      // first, check in-memory notification queue where listener may have placed the token payload
-      try{
-        const q = ((global as any).__inMemoryNotifQueues && (global as any).__inMemoryNotifQueues.get(String(userId))) || [];
-        if(Array.isArray(q) && q.length>0){
-          for(const payload of q){
-            try{
-              const toks = payload && payload.tokens ? payload.tokens : (payload && payload.event && payload.event.candidateTokens) || payload && payload.candidateTokens;
-              if(!toks) continue;
-              const arr = Array.isArray(toks) ? toks : [toks];
-              for(const tk of arr){ if((tk.tokenAddress||tk.address||tk.mint)===tokenAddress && tk.mergedSignal){ mergedOk = true; break; } }
-              if(mergedOk) break;
-            }catch(_){}
-          }
-        }
-      }catch(_){}
-      // fallback: query ledger engine directly
-      if(!mergedOk && eng && typeof eng.getMaskForMint === 'function'){
-        try{ const ls = eng.isStrongSignal(tokenAddress); if(ls) mergedOk = true; }catch(_e){}
-      }
-      // If not mergedOk, warn user and require explicit confirmation before buying
-      if(!mergedOk){
-        await ctx.reply(`⚠️ Token <code>${tokenAddress}</code> does not have a merged Sollet/Ledger signal (no strong evidence). Reply 'CONFIRM BUY ${tokenAddress}' to proceed.`, { parse_mode: 'HTML' });
-        return;
-      }
-    }catch(_e){ /* ignore validation errors and proceed cautiously */ }
 
-    await ctx.reply(`🛒 Buying token: <code>${tokenAddress}</code> with amount: <b>${amount}</b> SOL ...`, { parse_mode: 'HTML' });
-    let result: any;
-    try {
-      result = await unifiedBuy(tokenAddress, amount, user.secret);
-    } catch (err: any) {
-      const msg = err && err.message ? String(err.message) : String(err);
-      await ctx.reply('❌ Purchase cancelled: ' + msg);
-      console.error('showtoken buy error:', err);
-      return;
-    }
-    const showTx = extractTx(result);
-    if (showTx) {
-      const entry = `ShowTokenBuy: ${tokenAddress} | Amount: ${amount} SOL | Source: unifiedBuy | Tx: ${showTx}`;
-      user.history = user.history || [];
-      user.history.push(entry);
-      limitHistory(user);
-      saveUsers(users);
-      await ctx.reply(`Token bought successfully! Tx: ${showTx}`);
-    } else {
-      await ctx.reply('Buy failed: Transaction was not completed.');
-    }
-  } catch (e) {
-    await ctx.reply('❌ Error during buy: ' + getErrorMessage(e));
-    console.error('showtoken buy error:', e);
-  }
-});
-
-bot.action(/showtoken_sell_(.+)/, async (ctx) => {
-  const userId = String(ctx.from?.id);
-  // reload users from disk to pick up any runtime changes to strategy/wallet
-  users = loadUsers();
-  const user = users[userId];
-  const tokenAddress = ctx.match[1];
-  console.log(`[showtoken_sell] User: ${userId}, Token: ${tokenAddress}`);
-  if (!user || !hasWallet(user) || !user.strategy || !user.strategy.enabled) {
-    await ctx.reply('❌ No active strategy or wallet found.');
-    return;
-  }
-  try {
-    const sellPercent = Number(user.strategy && (user.strategy.sellPercent1 ?? user.strategy.sellPercent ?? 100));
-    const buyAmount = Number(user.strategy && user.strategy.buyAmount);
-    if (!buyAmount || isNaN(buyAmount) || buyAmount <= 0) {
-      await ctx.reply('❌ Cannot determine amount to sell because your strategy does not have a valid `buyAmount` configured. Set a buy amount in your strategy or use the sell command with an explicit amount.', { parse_mode: 'Markdown' });
-      return;
-    }
-    // Use buyAmount as an estimated holding to compute sell amount when exact balance is unknown
-    const balance = buyAmount;
-    const amount = (balance * sellPercent) / 100;
-    await ctx.reply(`🔻 Selling token: <code>${tokenAddress}</code> with <b>${sellPercent}%</b> of your balance (${balance}) ...`, { parse_mode: 'HTML' });
-    const result = await unifiedSell(tokenAddress, amount, user.secret);
-    if (result && result.tx) {
-      const entry = `ShowTokenSell: ${tokenAddress} | Amount: ${amount} | Source: unifiedSell | Tx: ${result.tx}`;
-      user.history = user.history || [];
-      user.history.push(entry);
-      limitHistory(user);
-      saveUsers(users);
-      await ctx.reply(`Token sold successfully! Tx: ${result.tx}`);
-    } else {
-      await ctx.reply('Sell failed: Transaction was not completed.');
-    }
-  } catch (e) {
-    await ctx.reply('❌ Error during sell: ' + getErrorMessage(e));
-    console.error('showtoken sell error:', e);
-  }
-});
       });
 
 // =================== Bot Launch ===================

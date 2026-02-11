@@ -46,6 +46,8 @@ export async function transactionSenderAndConfirmationWaiter({
   blockhashWithExpiryBlockHeight,
   sendOptions,
 }: TransactionSenderAndConfirmationWaiterArgs): Promise<VersionedTransactionResponse | null> {
+  // Allow callers to opt-in to async confirmation via env var CONFIRM_ASYNC=true
+  const confirmAsyncEnv = String(process.env.CONFIRM_ASYNC || '').toLowerCase() === 'true';
   // Default to DRY-RUN unless explicitly enabled. Require CONFIRM_SEND==='yes' as extra guard.
   const liveTrades = String(process.env.LIVE_TRADES || '').toLowerCase() === 'true';
   const confirmSend = String(process.env.CONFIRM_SEND || '').toLowerCase() === 'yes';
@@ -206,6 +208,15 @@ export async function transactionSenderAndConfirmationWaiter({
         // no fallback succeeded, rethrow original
         throw firstErr;
       }
+  }
+
+  // If configured to not wait for confirmation, return immediately with a minimal
+  // transaction object containing the signature. Callers treat a falsy response
+  // as DRY-RUN; returning an object with `transaction.signatures` keeps behavior
+  // compatible while avoiding long waits.
+  if (confirmAsyncEnv && txid) {
+    console.log('[transactionSenderAndConfirmationWaiter] CONFIRM_ASYNC enabled — returning after broadcast, signature=', txid);
+    return { transaction: { signatures: [txid] } } as any;
   }
 
   const controller = new AbortController();

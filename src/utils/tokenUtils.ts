@@ -396,10 +396,12 @@ function buildInlineKeyboard(token: any, botUsername: string, pairAddress: strin
     if (addr) {
       const buyText = '🟢 Buy';
       const sellText = '🔴 Sell';
-      // Use showtoken_* callbacks to align with existing show_token handlers
-      const buyCb = `showtoken_buy_${addr}`;
-      const sellCb = `showtoken_sell_${addr}`;
-      inlineKeyboard.push([ { text: buyText, callback_data: buyCb }, { text: sellText, callback_data: sellCb } ]);
+      const autoText = '🤖 التداول الآلي';
+      // Use buy_/sell_ callbacks that map to the existing buy/sell handlers
+      const buyCb = `buy_${addr}`;
+      const sellCb = `sell_${addr}`;
+      // Add Auto-trade button (passes the addr so handler can start immediately)
+      inlineKeyboard.push([ { text: buyText, callback_data: buyCb }, { text: sellText, callback_data: sellCb }, { text: autoText, callback_data: `auto_trade_${addr}` } ]);
     }
   } catch (e) { /* ignore */ }
   return { inlineKeyboard };

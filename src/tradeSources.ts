@@ -544,34 +544,66 @@ async function getDexPrice(tokenMint: string, amount: number) {
 
 // Helper: run sources sequentially (first success wins)
 async function raceSources(sources: any[], fnName: 'buy'|'sell', tokenMint: string, amount: number, secret: string): Promise<any> {
-  let errors: string[] = [];
-  for (let i = 0; i < sources.length; i++) {
-    try {
-      if (typeof sources[i][fnName] !== 'function') throw new Error(`${fnName} not implemented in source`);
-      const start = Date.now();
-      const result = await withTimeout(sources[i][fnName](tokenMint, amount, secret), 20000, sources[i].name || 'Unknown');
-      const end = Date.now();
-      let tx: any = null, price: any = null, signature: any = null;
-      if (typeof result === 'object' && result !== null) {
-        tx = 'tx' in result ? result.tx : null;
-        price = 'price' in result ? result.price : null;
-        signature = 'signature' in result ? result.signature : null;
+  // Run all sources in parallel and return the first successful result (fastest).
+  const perSourceTimeout = Number(process.env.SOURCE_TIMEOUT_MS || 5000);
+  const wrapped = sources.map((s: any) => {
+    return (async () => {
+      const sourceName = s.name || s.source || 'Unknown';
+      if (typeof s[fnName] !== 'function') {
+        const msg = `${fnName} not implemented in source ${sourceName}`;
+        logTrade({ action: fnName, source: sourceName, token: tokenMint, amount, price: null, tx: null, latency: 0, status: 'fail' });
+        throw new Error(msg);
       }
-      logTrade({ action: fnName, source: sources[i].name || sources[i].source || 'Unknown', token: tokenMint, amount, price: price as any, tx: (tx || signature) as any, latency: end - start, status: 'success' });
-      return { source: sources[i].name || sources[i].source || 'Unknown', txSignature: tx || signature, price, amount, latency: end - start };
-    } catch (e: any) {
-      errors.push(String(e));
-      logTrade({ action: fnName, source: sources[i].name || 'Unknown', token: tokenMint, amount, price: null, tx: null, latency: 0, status: 'fail' });
-      console.error(`[raceSources][${fnName}] Error:`, e);
-    }
+      const start = Date.now();
+      try {
+        const result = await withTimeout(s[fnName](tokenMint, amount, secret), perSourceTimeout, sourceName);
+        const end = Date.now();
+        let tx: any = null, price: any = null, signature: any = null;
+        if (typeof result === 'object' && result !== null) {
+          tx = 'tx' in result ? result.tx : null;
+          price = 'price' in result ? result.price : null;
+          signature = 'signature' in result ? result.signature : null;
+        }
+        logTrade({ action: fnName, source: sourceName, token: tokenMint, amount, price: price as any, tx: (tx || signature) as any, latency: end - start, status: 'success' });
+        return { source: sourceName, tx: tx || signature, price, amount, latency: end - start, raw: result };
+      } catch (err: any) {
+        logTrade({ action: fnName, source: sourceName, token: tokenMint, amount, price: null, tx: null, latency: 0, status: 'fail' });
+        console.error(`[raceSources][${fnName}] Error from ${sourceName}:`, err);
+        throw err;
+      }
+    })();
+  });
+
+  try {
+    // Promise.any resolves with the first fulfilled promise, rejecting only if all reject.
+    const winner = await Promise.any(wrapped);
+    const w: any = winner;
+    return { source: w.source || w.name || 'Unknown', txSignature: w.tx || (w.raw && (w.raw.signature || w.raw.bundleId)) || null, price: w.price, amount: w.amount, latency: w.latency, raw: w.raw };
+  } catch (aggErr: any) {
+    // All sources failed. Collect rejection reasons.
+    const settled = await Promise.allSettled(wrapped);
+    const errors = settled.filter(s => s.status === 'rejected').map(r => String((r as any).reason));
+    throw new Error('All sources failed: ' + errors.join(' | '));
   }
-  throw new Error('All sources failed: ' + errors.join(' | '));
 }
 
 // unifiedBuy
 export async function unifiedBuy(tokenMint: string, amount: number, payerKeypair: any) {
-  // Try sources in preferred order (Raydium then Jupiter) using sequential race.
+  // Fast-path: attempt a very short Raydium buy first to reduce latency for snipes.
+  const FAST_PATH_ENABLED = String(process.env.FAST_PATH_RAYDIUM || 'true').toLowerCase() === 'true';
+  const FAST_PATH_TIMEOUT_MS = Number(process.env.RAYDIUM_FAST_TIMEOUT_MS || 800);
   try {
+    if (FAST_PATH_ENABLED) {
+      try {
+        const r = await withTimeout(Raydium.buy(tokenMint, amount, payerKeypair), FAST_PATH_TIMEOUT_MS, 'raydium-fast');
+        if (r && (r.tx || r.signature)) {
+          return { tx: r.tx || r.signature, source: 'raydium', success: true, raw: r };
+        }
+      } catch (_e) {
+        // fast-path failed or timed out; fall back to full raceSources below
+      }
+    }
+    // Try sources in preferred order (Raydium then Jupiter) using parallel race.
     const res = await raceSources(BUY_SOURCES, 'buy', tokenMint, amount, payerKeypair);
     const r: any = res;
     return { tx: r.tx || r.txSignature || r.signature || null, source: r.source || r.name || 'unknown', success: !!(r.tx || r.txSignature || r.signature), raw: r };
