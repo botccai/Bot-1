@@ -494,9 +494,9 @@ const Raydium = {
   }
 };
 
-// Prefer Raydium first for lower-latency single-hop swaps, fallback to Jupiter
-const BUY_SOURCES = [Raydium, Jupiter];
-const SELL_SOURCES = [Raydium, Jupiter];
+// Prefer Jupiter first for broader route coverage, fallback to Raydium
+const BUY_SOURCES = [Jupiter, Raydium];
+const SELL_SOURCES = [Jupiter, Raydium];
 
 // getJupiterPrice, getRaydiumPrice, getDexPrice helpers (keep previous behavior but simplified)
 async function getJupiterPrice(tokenMint: string, amount: number) {
@@ -546,9 +546,46 @@ async function getDexPrice(tokenMint: string, amount: number) {
 async function raceSources(sources: any[], fnName: 'buy'|'sell', tokenMint: string, amount: number, secret: string): Promise<any> {
   // Run all sources in parallel and return the first successful result (fastest).
   const perSourceTimeout = Number(process.env.SOURCE_TIMEOUT_MS || 5000);
+  const PRECHECK_ENABLED = String(process.env.PRECHECK_ENABLED || 'true').toLowerCase() === 'true';
+  const PRECHECK_TIMEOUT_MS = Number(process.env.PRECHECK_TIMEOUT_MS || 1200);
+  const PRECHECK_MIN_OUT = Number(process.env.PRECHECK_MIN_OUT || 1); // minimal expected token units
   const wrapped = sources.map((s: any) => {
     return (async () => {
       const sourceName = s.name || s.source || 'Unknown';
+      // Lightweight pre-check to avoid expensive failing swaps: prefer quick quote/price checks
+      if (PRECHECK_ENABLED) {
+        try {
+          // Jupiter-specific quick quote
+          if ((sourceName || '').toLowerCase().includes('jupiter')) {
+            try {
+              const jupiter = require('@jup-ag/api').createJupiterApiClient();
+              const preSl = Number(process.env.PRECHECK_JUP_SLIPPAGE_BPS || process.env.JUPITER_SLIPPAGE_BPS || 30);
+              const q = await Promise.race([jupiter.quoteGet({ inputMint: 'So11111111111111111111111111111111111111112', outputMint: tokenMint, amount: Math.max(1, Math.floor(amount * 1e9)), slippageBps: preSl }), new Promise((_,rej)=>setTimeout(()=>rej(new Error('precheck timeout')), PRECHECK_TIMEOUT_MS))]);
+              if (!q || !q.routePlan) throw new Error('no jupiter route');
+              // try to infer outAmount
+              const rp = q.routePlan && (q.routePlan.routes && q.routePlan.routes[0] ? q.routePlan.routes[0] : q.routePlan);
+              const outAmt = Number(rp && (rp.outAmount || rp.outAmountLamports || rp.outAmountString) || 0);
+              if (!outAmt || outAmt < PRECHECK_MIN_OUT) throw new Error('insufficient out amount on jupiter quote');
+            } catch (je) {
+              console.warn('[raceSources] Jupiter pre-check failed for', tokenMint, (je as any)?.message ?? String(je));
+              throw je;
+            }
+          } else if ((sourceName || '').toLowerCase().includes('raydium')) {
+            // Generic Raydium sanity check using price helper (best-effort)
+            try {
+              const pr = await getRaydiumPrice(tokenMint, amount).catch(()=>null);
+              if (!pr || !pr.priceSol || Number(pr.priceSol) === 0) throw new Error('raydium price unavailable');
+            } catch (re) {
+              console.warn('[raceSources] Raydium pre-check failed for', tokenMint, (re as any)?.message ?? String(re));
+              throw re;
+            }
+          }
+        } catch (preErr) {
+          // Fail this source early
+          logTrade({ action: fnName, source: sourceName, token: tokenMint, amount, price: null, tx: null, latency: 0, status: 'precheck-fail' });
+          throw preErr;
+        }
+      }
       if (typeof s[fnName] !== 'function') {
         const msg = `${fnName} not implemented in source ${sourceName}`;
         logTrade({ action: fnName, source: sourceName, token: tokenMint, amount, price: null, tx: null, latency: 0, status: 'fail' });

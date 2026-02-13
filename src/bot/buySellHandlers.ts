@@ -5,6 +5,7 @@ import { getSolBalance } from '../getSolBalance';
 import { getGlobalSecretRaw } from '../wallet/globalWallet';
 import { upsertTrader, removeTrader, getAllTraders } from '../autoTraderState';
 import { startWsPriceFeed, getWsPrice } from '../utils/priceFeedWs';
+import { getSignatureStatus } from '../utils/v0.transaction';
 
 // In-memory maps for interactive flows and running auto-traders per user
 const awaitingAutoToken = new Map<string, boolean>();
@@ -184,6 +185,7 @@ export function registerBuySellHandlers(bot: any, users: Record<string, any>, bo
     const globalSecretRun = getGlobalSecretRaw();
     const effectiveSecretRun = user && (user.secret || globalSecretRun);
     const timeframes = ['5m','15m','4h','8h'];
+    const FRAMES_REQUIRED = Number(process.env.AUTO_HITS_FRAMES_REQUIRED || 3);
     // attempt to load persisted state for this trader
     let in_pos = false;
     let entry = 0 as number;
@@ -197,7 +199,7 @@ export function registerBuySellHandlers(bot: any, users: Record<string, any>, bo
       }
     }catch(_e){}
     const minBuySol = Number(process.env.AUTO_MIN_BUY_SOL || 0.0005);
-    const pollMs = Number(process.env.AUTO_POLL_MS || 400);
+    const pollMs = Number(process.env.AUTO_POLL_MS || 1000);
 
     async function fetch_price(): Promise<number> {
       // prefer websocket price when enabled
@@ -215,8 +217,8 @@ export function registerBuySellHandlers(bot: any, users: Record<string, any>, bo
     function canTrade(uid: string, mint: string){
       const key = metaKey(uid,mint);
       const info = tradeMeta.get(key) || { count: 0, lastTs: 0 };
-      const cooldown = Number(process.env.TRADE_COOLDOWN_MS || 30000);
-      const maxTrades = Number(process.env.MAX_TRADES_PER_TOKEN || 3);
+      const cooldown = Number(process.env.TRADE_COOLDOWN_MS || 60000);
+      const maxTrades = Number(process.env.MAX_TRADES_PER_TOKEN || 1);
       if (info.count >= maxTrades) return false;
       if (Date.now() - (info.lastTs || 0) < cooldown) return false;
       return true;
@@ -251,13 +253,15 @@ export function registerBuySellHandlers(bot: any, users: Record<string, any>, bo
         for (const tf of timeframes) {
           try {
             const ind = await fetch_indicators(tf);
-            if (ind.j <= 8.0 && ind.k >= 25.0 && ind.k <= 30.0 && ind.d >= 40.0 && ind.wr6 >= 85.0 && ind.wr10 >= 85.0 && ind.wr14 >= 85.0) {
+            // Use stochastic crossover (K > D) rather than a single D threshold.
+            // Keep K/J and WR checks as before.
+            if (ind.j <= 8.0 && ind.k >= 25.0 && ind.k <= 30.0 && (ind.k > ind.d) && ind.wr6 >= 85.0 && ind.wr10 >= 85.0 && ind.wr14 >= 85.0) {
               hits += 1;
             }
           } catch (e) { /* ignore tf error */ }
         }
         const price = await fetch_price();
-        if (!in_pos && hits >= 3) {
+        if (!in_pos && hits >= FRAMES_REQUIRED) {
           // compute buy amount = 10% of SOL balance
           const solBalBefore = await getSolBalance(user.wallet || user.secret || globalSecretRun || '');
           const buyAmt = Math.max(minBuySol, (solBalBefore * 0.10));
@@ -278,11 +282,25 @@ export function registerBuySellHandlers(bot: any, users: Record<string, any>, bo
                 const solBefore = await getSolBalance(user.wallet || user.secret || globalSecretRun || '').catch(()=>0);
                 const res = await unifiedBuy(mint, buyAmt, effectiveSecretRun);
                 const solAfter = await getSolBalance(user.wallet || user.secret || globalSecretRun || '').catch(()=>solBefore);
-                entry = priceBeforeSend || price;
-                in_pos = true;
-                recordTrade(uid, mint);
-                try{ upsertTrader({ userId: uid, mint, in_pos, entry, last_sell, createdAt: Date.now() }); }catch(_e){}
-                await ctx.reply(`✅ تم تنفيذ شراء تلقائي. Tx: ${res && res.tx ? res.tx : 'no-tx'}`);
+                const sig = res && (res.tx || res.signature || res.txid) ? (res.tx || res.signature || res.txid) : null;
+                const isLive = String(process.env.LIVE_TRADES || '').toLowerCase() === 'true';
+                let confirmed = !isLive; // if not live, treat as confirmed (simulation)
+                if (isLive && sig) {
+                  try {
+                    // wait for on-chain confirmation (uses utility with retries)
+                    const ok = await getSignatureStatus(String(sig));
+                    confirmed = !!ok;
+                  } catch (_e) { confirmed = false; }
+                }
+                if (confirmed) {
+                  entry = priceBeforeSend || price;
+                  in_pos = true;
+                  recordTrade(uid, mint);
+                  try{ upsertTrader({ userId: uid, mint, in_pos, entry, last_sell, createdAt: Date.now() }); }catch(_e){}
+                  await ctx.reply(`✅ تم تنفيذ شراء تلقائي. Tx: ${sig ? sig : 'no-tx'}`);
+                } else {
+                  await ctx.reply(`❌ شراء أُرسل لكن لم يُؤكّد على السلسلة بعد. Tx: ${sig ? sig : 'no-tx'}`);
+                }
               }
             }
           }
@@ -291,46 +309,66 @@ export function registerBuySellHandlers(bot: any, users: Record<string, any>, bo
           const sellPct = Number(process.env.AUTO_SELL_PROFIT_PERCENT || 1.5) / 100;
           const sellLower = entry * (1 + sellPct);
           const sellUpper = entry * (1 + (sellPct * 2));
-          if (price >= sellLower && price <= sellUpper) {
+          if (price >= sellLower) {
             const uid = String(user.id || user.chatId || user.username);
             const solBefore = await getSolBalance(user.wallet || user.secret || globalSecretRun || '').catch(()=>0);
             await ctx.reply(`⏳ شرط الربح تحقق (${(price/entry-1)*100}%), جاري بيع الكل...`);
-            if (!canTrade(uid, mint)) {
-              await ctx.reply('⚠️ تجاوزت حدود التداول المؤقتة أو داخل فترة التهدئة — تأجيل البيع.');
-            } else {
-              const res = await unifiedSell(mint, 'ALL', effectiveSecretRun);
-              const solAfter = await getSolBalance(user.wallet || user.secret || globalSecretRun || '').catch(()=>solBefore);
-              last_sell = price;
-              in_pos = false;
-              recordTrade(uid, mint);
-              try{ upsertTrader({ userId: uid, mint, in_pos, entry, last_sell, createdAt: Date.now() }); }catch(_e){}
-              await ctx.reply(`✅ بيع مكتمل. Tx: ${res && res.tx ? res.tx : 'no-tx'}`);
-            }
-          } else if (last_sell > 0 && price <= last_sell * (1 - (Number(process.env.REBUY_DROP_PERCENT || 3) / 100))) {
-            // rebuy with amount equal to last sold amount (approx by SOL balance diff)
-            const solNow = await getSolBalance(user.wallet || user.secret || globalSecretRun || '').catch(()=>0);
-            const rebuyAmt = Math.max(minBuySol, solNow * 0.10);
-            if (rebuyAmt >= minBuySol) {
-              const uid = String(user.id || user.chatId || user.username);
               if (!canTrade(uid, mint)) {
-                await ctx.reply('⚠️ تجاوزت حدود التداول المؤقتة أو داخل فترة التهدئة — تأجيل إعادة الشراء.');
+                await ctx.reply('⚠️ تجاوزت حدود التداول المؤقتة أو داخل فترة التهدئة — تأجيل البيع.');
               } else {
-                await ctx.reply(`⏳ إعادة شراء تلقائي بمقدار ${rebuyAmt} SOL لأن السعر هبط ${Number(process.env.REBUY_DROP_PERCENT||3)}% من آخر بيع.`);
-                const priceBeforeSend = await fetch_price().catch(()=>price);
-                const maxSlippage = Number(process.env.AUTO_MAX_SLIPPAGE_PERCENT || 3) / 100;
-                if (priceBeforeSend && Math.abs(priceBeforeSend - price) / (price || 1) > maxSlippage) {
-                  await ctx.reply('⚠️ القفز السعري مرتفع جداً — تخطي إعادة الشراء لهذه الدورة.');
-                } else {
-                  const res = await unifiedBuy(mint, rebuyAmt, effectiveSecretRun);
-                  entry = priceBeforeSend || price;
-                  in_pos = true;
+                const res = await unifiedSell(mint, 'ALL', effectiveSecretRun);
+                const solAfter = await getSolBalance(user.wallet || user.secret || globalSecretRun || '').catch(()=>solBefore);
+                const sig = res && (res.tx || res.signature || res.txid) ? (res.tx || res.signature || res.txid) : null;
+                const isLive = String(process.env.LIVE_TRADES || '').toLowerCase() === 'true';
+                let confirmed = !isLive;
+                if (isLive && sig) {
+                  try { confirmed = !!(await getSignatureStatus(String(sig))); } catch(_e){ confirmed = false; }
+                }
+                if (confirmed) {
+                  last_sell = price;
+                  in_pos = false;
                   recordTrade(uid, mint);
                   try{ upsertTrader({ userId: uid, mint, in_pos, entry, last_sell, createdAt: Date.now() }); }catch(_e){}
-                  await ctx.reply(`✅ إعادة شراء مكتمل. Tx: ${res && res.tx ? res.tx : 'no-tx'}`);
+                  await ctx.reply(`✅ بيع مكتمل. Tx: ${sig ? sig : 'no-tx'}`);
+                } else {
+                  await ctx.reply(`❌ بيع أُرسل لكن لم يُؤكّد على السلسلة بعد. Tx: ${sig ? sig : 'no-tx'}`);
+                }
+              }
+          }
+        }
+
+        // Rebuy logic: trigger when NOT currently in position and price dropped relative to last entry
+        // Use `entry` (last entry price) instead of `last_sell` to decide rebuy threshold.
+        if (!in_pos) {
+          try {
+            const entryPrice = entry || 0;
+            const dropPct = Number(process.env.REBUY_DROP_PERCENT || 3) / 100;
+            if (entryPrice > 0 && price <= entryPrice * (1 - dropPct)) {
+              // rebuy with amount equal to a portion of current SOL balance
+              const solNow = await getSolBalance(user.wallet || user.secret || globalSecretRun || '').catch(()=>0);
+              const rebuyAmt = Math.max(minBuySol, solNow * 0.10);
+              if (rebuyAmt >= minBuySol) {
+                const uid = String(user.id || user.chatId || user.username);
+                if (!canTrade(uid, mint)) {
+                  await ctx.reply('⚠️ تجاوزت حدود التداول المؤقتة أو داخل فترة التهدئة — تأجيل إعادة الشراء.');
+                } else {
+                  await ctx.reply(`⏳ إعادة شراء تلقائي بمقدار ${rebuyAmt} SOL لأن السعر هبط ${Number(process.env.REBUY_DROP_PERCENT||3)}% من آخر دخول (entry).`);
+                  const priceBeforeSend = await fetch_price().catch(()=>price);
+                  const maxSlippage = Number(process.env.AUTO_MAX_SLIPPAGE_PERCENT || 3) / 100;
+                  if (priceBeforeSend && Math.abs(priceBeforeSend - price) / (price || 1) > maxSlippage) {
+                    await ctx.reply('⚠️ القفز السعري مرتفع جداً — تخطي إعادة الشراء لهذه الدورة.');
+                  } else {
+                    const res = await unifiedBuy(mint, rebuyAmt, effectiveSecretRun);
+                    entry = priceBeforeSend || price;
+                    in_pos = true;
+                    recordTrade(uid, mint);
+                    try{ upsertTrader({ userId: uid, mint, in_pos, entry, last_sell, createdAt: Date.now() }); }catch(_e){}
+                    await ctx.reply(`✅ إعادة شراء مكتمل. Tx: ${res && res.tx ? res.tx : 'no-tx'}`);
+                  }
                 }
               }
             }
-          }
+          } catch (e:any) { /* ignore rebuy errors */ }
         }
       } catch (e:any) {
         console.error('[autoTrader] loop error', e);

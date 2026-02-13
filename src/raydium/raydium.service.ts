@@ -351,22 +351,40 @@ export class RaydiumSwapService {
       const outDecimal = is_buy ? decimal : 9;
       // in_amount
       const amount = Number(((_amount - fee) * 10 ** inDecimal).toFixed(0));
-      // Accept multiple secret key encodings: base58 64/32 bytes, JSON array, or hex.
+      // Accept multiple secret key encodings: JSON array, bs58, base64, or hex.
       // Normalize to Uint8Array and use appropriate Keypair constructor.
-      let decodedKey: Uint8Array;
+      let decodedKey: Uint8Array = new Uint8Array();
       try {
         if (typeof pk === 'string' && pk.trim().startsWith('[')) {
           const arr = JSON.parse(pk);
           decodedKey = Uint8Array.from(arr);
-        } else {
+        } else if (typeof pk === 'string') {
+          // Try bs58 first (common for Solana keys)
           try {
             decodedKey = bs58.decode(pk);
-          } catch (e) {
-            decodedKey = Uint8Array.from(Buffer.from(pk, 'hex'));
+          } catch (_) {
+            // Try base64
+            try {
+              const buf = Buffer.from(pk, 'base64');
+              if (buf && (buf.length === 64 || buf.length === 32)) decodedKey = Uint8Array.from(buf);
+              else {
+                // Fallback to hex
+                const hexBuf = Buffer.from(pk, 'hex');
+                if (hexBuf && (hexBuf.length === 64 || hexBuf.length === 32)) decodedKey = Uint8Array.from(hexBuf);
+              }
+            } catch (__e) {
+              // Last resort: try hex directly
+              try {
+                const hexBuf2 = Buffer.from(pk, 'hex');
+                if (hexBuf2 && (hexBuf2.length === 64 || hexBuf2.length === 32)) decodedKey = Uint8Array.from(hexBuf2);
+              } catch (hexErr) {
+                // leave decodedKey empty to trigger error below
+              }
+            }
           }
         }
       } catch (e) {
-        console.error('[RaydiumSwapService] failed to decode secret key', e);
+        console.error('[RaydiumSwapService] failed to decode secret key', (e as any)?.message ?? String(e));
         throw e;
       }
 
