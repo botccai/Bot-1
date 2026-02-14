@@ -1153,6 +1153,15 @@ bot.on('text', async (ctx, next) => {
         { text: '⏹️ ' + t('cex.stop_sniper', userId), callback_data: 'cex_stop' }
       ]);
       rows.push([
+        { text: '🚀 Start DEX AutoTrader', callback_data: 'cex_start_autotrader' },
+        { text: '🛑 Stop DEX AutoTrader', callback_data: 'cex_stop_autotrader' }
+      ]);
+      // Add a dedicated instant snipe button (separate path from AutoTrader)
+      rows.push([
+        { text: '⚡️ Snipe DEX (instant)', callback_data: 'cex_dex_snipe' },
+        { text: '🛑 Stop Snipe', callback_data: 'cex_stop_dex_snipe' }
+      ]);
+      rows.push([
         { text: '📊 ' + t('cex.status', userId), callback_data: 'cex_status' },
         { text: '📜 ' + t('cex.history', userId), callback_data: 'cex_history' }
       ]);
@@ -1269,6 +1278,56 @@ bot.action('cex_change_keys', async (ctx) => {
     expecting.add(userId);
     return ctx.reply(t('cex.prompt_enter_keys', userId));
   } catch (e: any) { console.error('cex_change_keys error', e); return ctx.reply(t('cex.api_keys_save_failed', userId)); }
+});
+
+// Start DEX AutoTrader flow: ask user for mint (reuses awaitingAutoToken path)
+bot.action('cex_start_autotrader', async (ctx) => {
+  const userId = String(ctx.from?.id);
+  try {
+    const chatType = (ctx.chat && (ctx.chat as any).type) || '';
+    if (chatType !== 'private') return ctx.reply(t('cex.private_chat_required', userId));
+    awaitingAutoToken.set(userId, true);
+    return ctx.reply('🔁 أرسل عنوان المينت (token mint) لبدء DEX AutoTrader في الخلفية، أو أرسل /cancel لإلغاء.');
+  } catch (e:any) { console.error('cex_start_autotrader error', e); return ctx.reply('خطأ داخلي'); }
+});
+
+bot.action('cex_stop_autotrader', async (ctx) => {
+  const userId = String(ctx.from?.id);
+  try {
+    const cex = require('./cexSniper.js');
+    const res = await cex.stopAutoTraderProcess(userId);
+    if (!res || !res.ok) return ctx.reply('Failed to stop AutoTrader: ' + (res && res.err ? res.err : 'unknown'));
+    return ctx.reply('AutoTrader stopped (pid: ' + res.pid + ')');
+  } catch (e:any) { console.error('cex_stop_autotrader error', e); return ctx.reply('خطأ داخلي'); }
+});
+
+// Dedicated instant DEX snipe: buy 0.02 SOL immediately and sell ALL after 1s
+bot.action('cex_dex_snipe', async (ctx) => {
+  const userId = String(ctx.from?.id);
+  try {
+    const chatType = (ctx.chat && (ctx.chat as any).type) || '';
+    if (chatType !== 'private') return ctx.reply('This action must be used in a private chat.');
+    users = loadUsers();
+    const user = users[userId];
+    if (!user) return ctx.reply('User not found');
+    // register user for live snipe
+    try {
+      const snipe = require('./scripts/dexInstantSniper');
+      const res = snipe && typeof snipe.startUserSnipe === 'function' ? snipe.startUserSnipe(userId) : { ok: false, err: 'module missing' };
+      if (!res || !res.ok) return ctx.reply('Failed to enable live snipe: ' + (res && res.err ? res.err : 'unknown'));
+      return ctx.reply('✅ Live DEX snipe enabled — listening for fresh mints and will execute instant buy (0.02 SOL) then sell after 1s.');
+    } catch (e:any) { console.error('cex_dex_snipe enable error', e); return ctx.reply('Failed to enable live snipe: ' + ((e && e.message) || String(e))); }
+  } catch (e:any) { console.error('cex_dex_snipe error', e); return ctx.reply('خطأ داخلي: ' + ((e && e.message) || String(e))); }
+});
+
+bot.action('cex_stop_dex_snipe', async (ctx) => {
+  const userId = String(ctx.from?.id);
+  try {
+    const snipe = require('./scripts/dexInstantSniper');
+    const res = snipe && typeof snipe.stopUserSnipe === 'function' ? snipe.stopUserSnipe(userId) : { ok: false, err: 'module missing' };
+    if (!res || !res.ok) return ctx.reply('Failed to stop live snipe: ' + (res && res.err ? res.err : 'unknown'));
+    return ctx.reply('🛑 Live DEX snipe disabled for your user.');
+  } catch (e:any) { console.error('cex_stop_dex_snipe error', e); return ctx.reply('خطأ داخلي'); }
 });
 
 // Show submenu for token requests (analysis / trade request)
@@ -1747,6 +1806,18 @@ bot.on('text', async (ctx: any, next: any) => {
     try { if (!usedUser2.id && !usedUser2.username) usedUser2.id = userId; } catch (_) {}
     const res = await autoExecuteStrategyForUser(usedUser2, tokens, 'buy', { simulateOnly: simulateOnly, listenerBypass: true });
     await ctx.reply(`✅ Auto Trade finished for ${mint}. Results: ${JSON.stringify(res)}`);
+    // Start background continuous DEX AutoTrader for this user+mint (detached)
+    try {
+      const cex = require('./cexSniper.js');
+      const sp = await cex.startAutoTraderProcess(userId, mint, {});
+      if (sp && sp.ok) {
+        await ctx.reply(`🔁 Started background AutoTrader (pid=${sp.pid}) for ${mint}`);
+      } else {
+        await ctx.reply(`⚠️ Could not start background AutoTrader: ${sp && sp.err ? sp.err : 'unknown'}`);
+      }
+    } catch (e:any) {
+      console.warn('failed to start background AutoTrader', e);
+    }
   } catch (e:any) {
     console.error('[auto_trade text reply] error', e);
     await ctx.reply('❌ خطأ أثناء تشغيل التداول الآلي: ' + (e && e.message ? e.message : String(e)));

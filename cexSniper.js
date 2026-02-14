@@ -191,3 +191,72 @@ async function executeOrder(userId, symbol, side, usdtSize, keys, opts) {
 }
 
 module.exports = { startUserCexSniper, stopUserCexSniper, getUserCexSniperStatus, getUserTradeHistory, addTradeRecord, analyzeSymbol, requestEnableLive, _passesFilters, executeOrder };
+// --- AutoTrader process helpers (spawn detached runAutoTrader per user)
+/**
+ * Start background runAutoTrader process for a user and mint.
+ * Stores pid in running map under meta.autoTraderPid
+ */
+function startAutoTraderProcess(userId, mint, opts) {
+  try {
+    if (!userId) return { ok: false, err: 'missing userId' };
+    if (!mint) return { ok: false, err: 'missing mint' };
+    const key = String(userId);
+    const meta = running.get(key) || { startedAt: Date.now(), keys: null, opts: {} };
+    if (meta.autoTraderName) return { ok: false, err: 'auto_trader_already_running', name: meta.autoTraderName };
+    const { spawnSync } = require('child_process');
+    const short = String(mint).slice(0, 8).replace(/[^a-zA-Z0-9]/g, '');
+    const name = `autoTrader-${userId}-${short}`;
+    // Ensure logs directory exists
+    try { const p = require('path'); const logsDir = p.join(process.cwd(), 'logs'); if (!require('fs').existsSync(logsDir)) require('fs').mkdirSync(logsDir, { recursive: true }); } catch (e) {}
+    // Start via pm2: pm2 start npx --name <name> -- ts-node --transpile-only scripts/runAutoTrader.ts <mint> <userId>
+    const startArgs = ['start', 'npx', '--name', name, '--', 'ts-node', '--transpile-only', 'scripts/runAutoTrader.ts', String(mint), String(userId)];
+    const startRes = spawnSync('pm2', startArgs, { cwd: process.cwd(), env: Object.assign({}, process.env, opts && opts.env || {}), encoding: 'utf8' });
+    if (startRes.error) return { ok: false, err: String(startRes.error) };
+    // retrieve PID
+    const pidRes = spawnSync('pm2', ['pid', name], { encoding: 'utf8' });
+    let pid = null;
+    if (!pidRes.error && pidRes.stdout) {
+      const out = pidRes.stdout.trim();
+      const n = Number(out);
+      if (!isNaN(n) && n > 0) pid = n;
+    }
+    meta.autoTraderName = name;
+    meta.autoTraderPid = pid;
+    meta.autoTraderMint = String(mint);
+    running.set(key, meta);
+    return { ok: true, name, pid, mint: String(mint), pm2out: startRes.stdout, pm2err: startRes.stderr };
+  } catch (e) { return { ok: false, err: String(e) }; }
+}
+
+/**
+ * Stop background runAutoTrader process for a user.
+ */
+function stopAutoTraderProcess(userId) {
+  try {
+    if (!userId) return { ok: false, err: 'missing userId' };
+    const key = String(userId);
+    const meta = running.get(key);
+    if (!meta || (!meta.autoTraderPid && !meta.autoTraderName)) return { ok: false, err: 'no_auto_trader' };
+    const { spawnSync } = require('child_process');
+    if (meta.autoTraderName) {
+      const name = meta.autoTraderName;
+      const stopRes = spawnSync('pm2', ['delete', name], { encoding: 'utf8' });
+      delete meta.autoTraderName;
+      delete meta.autoTraderPid;
+      delete meta.autoTraderMint;
+      running.set(key, meta);
+      if (stopRes.error) return { ok: false, err: String(stopRes.error) };
+      return { ok: true, name, res: stopRes.stdout };
+    }
+    // fallback: try to kill pid directly
+    const pid = meta.autoTraderPid;
+    try { process.kill(pid, 'SIGTERM'); } catch (e) { try { process.kill(pid, 0); } catch (_) {} }
+    delete meta.autoTraderPid;
+    delete meta.autoTraderMint;
+    running.set(key, meta);
+    return { ok: true, pid };
+  } catch (e) { return { ok: false, err: String(e) }; }
+}
+
+module.exports.startAutoTraderProcess = startAutoTraderProcess;
+module.exports.stopAutoTraderProcess = stopAutoTraderProcess;

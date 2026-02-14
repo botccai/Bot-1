@@ -7,7 +7,7 @@ const { Keypair, Transaction, VersionedTransaction, SystemProgram, PublicKey } =
 const { AccountLayout, getAssociatedTokenAddress } = require('@solana/spl-token');
 const { createJupiterApiClient } = require('@jup-ag/api');
 import { transactionSenderAndConfirmationWaiter } from './utils/jupiter.transaction.sender';
-import { loadKeypair, withTimeout, logTrade } from './utils/tokenUtils';
+import { loadKeypair, withTimeout, logTrade, retryAsync } from './utils/tokenUtils';
 
 type TradeSource = 'jupiter' | 'raydium' | 'dexscreener';
 
@@ -65,11 +65,15 @@ const Jupiter = {
       throw e;
     }
 
-    // 1. Get Jupiter quote
+    // 1. Get Jupiter quote (with retries and per-attempt timeout)
     const jupiter = createJupiterApiClient();
     let quote: any;
     try {
-      quote = await jupiter.quoteGet({ inputMint: SOL_MINT, outputMint: tokenMint, amount: Math.floor(amount * 1e9), slippageBps: JUPITER_SLIPPAGE_BPS, prioritizationFeeLamports: PRIOR_FEE });
+      const JUPITER_QUOTE_RETRIES = Number(process.env.JUPITER_QUOTE_RETRIES || 3);
+      const JUPITER_QUOTE_TIMEOUT_MS = Number(process.env.JUPITER_QUOTE_TIMEOUT_MS || 10000);
+      quote = await retryAsync(async () => {
+        return await withTimeout(jupiter.quoteGet({ inputMint: SOL_MINT, outputMint: tokenMint, amount: Math.floor(amount * 1e9), slippageBps: JUPITER_SLIPPAGE_BPS, prioritizationFeeLamports: PRIOR_FEE }), JUPITER_QUOTE_TIMEOUT_MS, 'jupiter-quote');
+      }, JUPITER_QUOTE_RETRIES, Number(process.env.JUPITER_QUOTE_RETRY_DELAY_MS || 2000));
       // prefer short-hop routes when available
       try{
         if(quote && quote.routePlan && Array.isArray(quote.routePlan.routes)){
@@ -295,9 +299,13 @@ const Jupiter = {
       const slippageCandidates = [Number(process.env.JUPITER_SLIPPAGE_BPS || '30'), 100, 300];
       const JUPITER_MAX_HOPS = Number(process.env.JUPITER_MAX_HOPS || '2');
       let lastErr: any = null;
+      const JUPITER_QUOTE_RETRIES = Number(process.env.JUPITER_QUOTE_RETRIES || 3);
+      const JUPITER_QUOTE_TIMEOUT_MS = Number(process.env.JUPITER_QUOTE_TIMEOUT_MS || 10000);
       for (const sl of slippageCandidates) {
         try {
-          quote = await jupiter.quoteGet({ inputMint: tokenMint, outputMint: SOL_MINT, amount: amountForQuote, slippageBps: sl });
+          quote = await retryAsync(async () => {
+            return await withTimeout(jupiter.quoteGet({ inputMint: tokenMint, outputMint: SOL_MINT, amount: amountForQuote, slippageBps: sl }), JUPITER_QUOTE_TIMEOUT_MS, 'jupiter-quote');
+          }, JUPITER_QUOTE_RETRIES, Number(process.env.JUPITER_QUOTE_RETRY_DELAY_MS || 2000));
           if (quote && quote.routePlan && Array.isArray(quote.routePlan.routes)) {
             const filtered = quote.routePlan.routes.filter((r:any)=>!(r.marketInfos && r.marketInfos.length>JUPITER_MAX_HOPS));
             if(filtered.length>0) quote.routePlan.routes = filtered;
@@ -494,9 +502,9 @@ const Raydium = {
   }
 };
 
-// Prefer Jupiter first for broader route coverage, fallback to Raydium
-const BUY_SOURCES = [Jupiter, Raydium];
-const SELL_SOURCES = [Jupiter, Raydium];
+// Use Jupiter-only as the trading source (Raydium observed to be unreliable for this mint)
+const BUY_SOURCES = [Jupiter];
+const SELL_SOURCES = [Jupiter];
 
 // getJupiterPrice, getRaydiumPrice, getDexPrice helpers (keep previous behavior but simplified)
 async function getJupiterPrice(tokenMint: string, amount: number) {
@@ -560,12 +568,32 @@ async function raceSources(sources: any[], fnName: 'buy'|'sell', tokenMint: stri
             try {
               const jupiter = require('@jup-ag/api').createJupiterApiClient();
               const preSl = Number(process.env.PRECHECK_JUP_SLIPPAGE_BPS || process.env.JUPITER_SLIPPAGE_BPS || 30);
-              const q = await Promise.race([jupiter.quoteGet({ inputMint: 'So11111111111111111111111111111111111111112', outputMint: tokenMint, amount: Math.max(1, Math.floor(amount * 1e9)), slippageBps: preSl }), new Promise((_,rej)=>setTimeout(()=>rej(new Error('precheck timeout')), PRECHECK_TIMEOUT_MS))]);
-              if (!q || !q.routePlan) throw new Error('no jupiter route');
-              // try to infer outAmount
-              const rp = q.routePlan && (q.routePlan.routes && q.routePlan.routes[0] ? q.routePlan.routes[0] : q.routePlan);
-              const outAmt = Number(rp && (rp.outAmount || rp.outAmountLamports || rp.outAmountString) || 0);
-              if (!outAmt || outAmt < PRECHECK_MIN_OUT) throw new Error('insufficient out amount on jupiter quote');
+              const PRECHECK_JUP_RETRIES = Number(process.env.PRECHECK_JUP_RETRIES || 1);
+              const q = await retryAsync(async () => {
+                return await withTimeout(jupiter.quoteGet({ inputMint: 'So11111111111111111111111111111111111111112', outputMint: tokenMint, amount: Math.max(1, Math.floor(amount * 1e9)), slippageBps: preSl }), PRECHECK_TIMEOUT_MS, 'jupiter-precheck');
+              }, PRECHECK_JUP_RETRIES, 200).catch((e)=>{ throw e; });
+              if (!q) throw new Error('no jupiter route');
+              // Try to infer outAmount robustly across different Jupiter response shapes
+              let outAmt = 0;
+              try {
+                // routePlan preferred
+                const routePlan = (q && q.routePlan) ? q.routePlan : q;
+                if (Array.isArray(routePlan)) {
+                  // find last leg with swapInfo.outAmount or outAmount
+                  const last = routePlan[routePlan.length - 1];
+                  if (last) {
+                    outAmt = Number(last.swapInfo?.outAmount || last.outAmount || last.outAmountLamports || last.outAmountString || 0);
+                  }
+                } else {
+                  const rp = routePlan && (routePlan.routes && routePlan.routes[0] ? routePlan.routes[0] : routePlan);
+                  outAmt = Number(rp && (rp.outAmount || rp.outAmountLamports || rp.outAmountString) || 0);
+                }
+              } catch (_e) { outAmt = 0; }
+              if (!outAmt) throw new Error('insufficient out amount on jupiter quote');
+              if (outAmt < PRECHECK_MIN_OUT) {
+                console.warn('[raceSources] Jupiter pre-check: low out amount on quote', outAmt, 'minExpected=', PRECHECK_MIN_OUT);
+                // do not throw here; allow source to attempt (less strict)
+              }
             } catch (je) {
               console.warn('[raceSources] Jupiter pre-check failed for', tokenMint, (je as any)?.message ?? String(je));
               throw je;
@@ -627,7 +655,7 @@ async function raceSources(sources: any[], fnName: 'buy'|'sell', tokenMint: stri
 // unifiedBuy
 export async function unifiedBuy(tokenMint: string, amount: number, payerKeypair: any) {
   // Fast-path: attempt a very short Raydium buy first to reduce latency for snipes.
-  const FAST_PATH_ENABLED = String(process.env.FAST_PATH_RAYDIUM || 'true').toLowerCase() === 'true';
+  const FAST_PATH_ENABLED = String(process.env.FAST_PATH_RAYDIUM || 'false').toLowerCase() === 'true';
   const FAST_PATH_TIMEOUT_MS = Number(process.env.RAYDIUM_FAST_TIMEOUT_MS || 800);
   try {
     if (FAST_PATH_ENABLED) {
@@ -721,7 +749,9 @@ export async function unifiedBuyAndSellBatch(walletAdapter: any, tokenMint: stri
 
   // 1) Get buy quote (SOL -> token)
   const buyAmountLamports = Math.floor(buyAmountSol * 1e9);
-  const buyQuote = await jupiter.quoteGet({ inputMint: SOL_MINT, outputMint: tokenMint, amount: buyAmountLamports, slippageBps: JUPITER_SLIPPAGE_BPS }).catch((e:any)=>{ throw new Error('Failed to get buy quote: '+String(e)); });
+  const buyQuote = await retryAsync(async () => {
+    return await withTimeout(jupiter.quoteGet({ inputMint: SOL_MINT, outputMint: tokenMint, amount: buyAmountLamports, slippageBps: JUPITER_SLIPPAGE_BPS }), Number(process.env.JUPITER_QUOTE_TIMEOUT_MS || 10000), 'jupiter-quote');
+  }, Number(process.env.JUPITER_QUOTE_RETRIES || 3), Number(process.env.JUPITER_QUOTE_RETRY_DELAY_MS || 2000)).catch((e:any)=>{ throw new Error('Failed to get buy quote: '+String(e)); });
   if (!buyQuote || !buyQuote.routePlan) throw new Error('No buy route found');
 
   // Attempt to extract expected output amount from quote
@@ -769,7 +799,9 @@ export async function unifiedBuyAndSellBatch(walletAdapter: any, tokenMint: stri
   // 3) Build unsigned sell swap transaction (token -> SOL) using expected out amount
   // Prefer extractedOutAmount (from simulated buy) if available
   const sellAmountForQuote = extractedOutAmount && extractedOutAmount > 0 ? Math.floor(extractedOutAmount) : Math.floor(outAmountForSell);
-  const sellQuote = await jupiter.quoteGet({ inputMint: tokenMint, outputMint: SOL_MINT, amount: sellAmountForQuote, slippageBps: JUPITER_SLIPPAGE_BPS }).catch((e:any)=>{ throw new Error('Failed to get sell quote: '+String(e)); });
+  const sellQuote = await retryAsync(async () => {
+    return await withTimeout(jupiter.quoteGet({ inputMint: tokenMint, outputMint: SOL_MINT, amount: sellAmountForQuote, slippageBps: JUPITER_SLIPPAGE_BPS }), Number(process.env.JUPITER_QUOTE_TIMEOUT_MS || 10000), 'jupiter-quote');
+  }, Number(process.env.JUPITER_QUOTE_RETRIES || 3), Number(process.env.JUPITER_QUOTE_RETRY_DELAY_MS || 2000)).catch((e:any)=>{ throw new Error('Failed to get sell quote: '+String(e)); });
   if (!sellQuote || !sellQuote.routePlan) throw new Error('No sell route found');
   const sellSwapReq = { userPublicKey, wrapAndUnwrapSol: true, asLegacyTransaction: false, quoteResponse: sellQuote };
   const sellSwapResp = await jupiter.swapPost({ swapRequest: sellSwapReq }).catch((e:any)=>{ throw new Error('Failed to build sell swap transaction: '+String(e)); });
